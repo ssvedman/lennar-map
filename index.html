@@ -212,6 +212,16 @@
     box-shadow: 0 1px 3px rgba(0,0,0,0.25);
     flex-shrink: 0;
   }
+  .legend-pct {
+    font-size: 10px;
+    font-weight: 700;
+    color: #334155;
+    background: #e2e8f0;
+    border-radius: 9px;
+    padding: 1px 6px;
+    margin-left: 3px;
+    flex-shrink: 0;
+  }
   .gmaps-link {
     display: inline-block;
     margin-top: 4px;
@@ -609,7 +619,7 @@
       <button id="trade-clear-btn">✕ Clear trade filter</button>
     </div>
     <div id="vendor-legend">
-      <div id="vendor-legend-label">Vendor Key</div>
+      <div id="vendor-legend-label">Vendor Key · % of starts (next 12 mo)</div>
       <div id="vendor-legend-items"></div>
     </div>
     <div id="sidebar-stats"><strong id="stat-count">52</strong> communities shown &nbsp;·&nbsp; <strong id="stat-starts">—</strong> total starts</div>
@@ -926,10 +936,22 @@ function updateVendorColors() {
     )].sort();
     vendorColorMap = {};
     vendors.forEach((v, i) => { vendorColorMap[v] = VENDOR_COLORS[i % VENDOR_COLORS.length]; });
-    // Render legend
-    legendItems.innerHTML = vendors.map(v =>
-      `<div class="legend-item"><div class="legend-dot" style="background:${vendorColorMap[v]}"></div>${v}</div>`
-    ).join('');
+    // Tally each vendor's share of starts over the next 12 months (whole starts window)
+    const vendorStarts = {};
+    let grandTotal = 0;
+    communities.forEach(c => {
+      if (c.trades && c.trades[currentTrade]) {
+        const v = c.trades[currentTrade];
+        const s = (c.starts || []).reduce((a, b) => a + b, 0);
+        vendorStarts[v] = (vendorStarts[v] || 0) + s;
+        grandTotal += s;
+      }
+    });
+    // Render legend with a % bubble next to each vendor
+    legendItems.innerHTML = vendors.map(v => {
+      const pct = grandTotal > 0 ? Math.round((vendorStarts[v] || 0) / grandTotal * 100) : 0;
+      return `<div class="legend-item"><div class="legend-dot" style="background:${vendorColorMap[v]}"></div>${v}<span class="legend-pct" title="${vendorStarts[v] || 0} of ${grandTotal} starts over next 12 months">${pct}%</span></div>`;
+    }).join('');
     legend.style.display = 'block';
     // Color visible markers
     communities.forEach((c, idx) => {
