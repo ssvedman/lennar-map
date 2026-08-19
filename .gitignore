@@ -7,7 +7,18 @@ Thumbs.db
 
 # Node — the tools here are dependency-free on purpose; this is only here so a
 # stray install cannot get committed.
+#
+# The manifests matter as much as node_modules/. Installing SheetJS or jsdom to
+# run the tools writes a package-lock.json (and sometimes a package.json) beside
+# them, and neither was covered here — so the first `git add -A` after an install
+# would have committed a lockfile for dependencies this repo deliberately does
+# not declare.
 node_modules/
+package.json
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+pnpm-lock.yaml
 npm-debug.log*
 
 # Local scratch

@@ -101,10 +101,17 @@ function makeLeafletStub(win) {
 
 /* ── boot ──────────────────────────────────────────────────────────────────── */
 async function boot(opts = {}) {
-  const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8')
+  let html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8')
     // Strip the vendored Leaflet tags; the stub is injected instead.
     .replace(/<link rel="stylesheet" href="vendor\/[\s\S]*?\/>/, '')
     .replace(/<script src="vendor\/[\s\S]*?<\/script>/, '');
+
+  // The real deadline is 8 s, which is right for a browser and far too long for a
+  // test run. Rewrite the constant rather than making it configurable in
+  // production code for the benefit of the harness.
+  if (opts.timeoutMs) {
+    html = html.replace(/timeoutMs:\s*\d+/, `timeoutMs: ${opts.timeoutMs}`);
+  }
 
   const dom = new JSDOM(html, {
     runScripts: 'outside-only',
@@ -123,8 +130,42 @@ async function boot(opts = {}) {
   };
   if (opts.mutate) opts.mutate(files);
 
-  win.fetch = url => {
+  /* The document lives in Supabase now, so the default path through loadData is
+     the map_public fetch, not the files. The row is derived from the same fixtures
+     after mutate() runs, which means every existing test that edits data.json
+     still exercises the code it always did — it just arrives over the database
+     path, as it does in production.
+
+     opts.dbFail omits the row to force the file fallback. The PostgREST URL
+     collapses to the bare object name under the stub's basename matching, so
+     'map_public' is the key to add or withhold. It is a view, not the table:
+     anon has no privileges on map_data at all.                                 */
+  if (files['data.json'] && !opts.dbFail) {
+    files['map_public'] = {
+      payload: files['data.json'],
+      people: files['people.json'] || { people: {} },
+      updated_at: opts.publishedAt || new Date().toISOString()
+    };
+    if (opts.dbMutate) opts.dbMutate(files['map_public']);
+  }
+
+  const requested = [];
+  win.__requested = requested;
+  win.fetch = (url, init) => {
+    requested.push(String(url));
     const name = String(url).split('?')[0].replace(/^.*\//, '');
+
+    // A hung database request must fall back rather than wait forever, so the
+    // abort signal has to be honoured here or that path is never tested.
+    if (name === 'map_public' && opts.dbHang) {
+      return new Promise((_, reject) => {
+        const sig = init && init.signal;
+        if (sig) sig.addEventListener('abort', () => {
+          const e = new Error('aborted'); e.name = 'AbortError'; reject(e);
+        });
+      });
+    }
+
     if (files[name]) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(files[name]) });
     return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
   };
@@ -143,11 +184,19 @@ async function boot(opts = {}) {
     ;window.__state = () => ({
       communities, groups, markers, popupSelection, lastFiltered,
       currentFilter, currentSearch, currentTrade, currentVendor, activeItem,
-      months, next3Idx, dataStart, meta
+      months, next3Idx, dataStart, meta, unlocated
     });`);
 
-  // Let the async init() settle.
-  for (let i = 0; i < 60 && !(win.__state && win.__state().communities.length); i++) await new Promise(r => setTimeout(r, 20));
+  // Let the async init() settle. Tests that expect zero placeable communities
+  // would otherwise spin the full timeout, so also stop once the error panel is
+  // up — the two are the only terminal states init() has.
+  const settled = () => {
+    if (!win.__state) return false;
+    if (win.__state().communities.length) return true;
+    const err = win.document.getElementById('load-error');
+    return !!(err && err.style.display === 'flex');
+  };
+  for (let i = 0; i < 60 && !settled(); i++) await new Promise(r => setTimeout(r, 20));
   await new Promise(r => setTimeout(r, 60));
   return win;
 }
@@ -491,6 +540,132 @@ async function boot(opts = {}) {
     assert(S(w).communities.length === 71, 'the map should still render');
     eq(w.getCurrentIdx() > 1, true, 'fixture should be out of range');
     eq(w.checkDataStart(), false, 'checkDataStart should report the problem');
+  });
+
+  /* ── Supabase source and fallback ─────────────────────────────────────────
+     The document moved from two committed files into map_data so that one upload
+     in Blueprint can feed this map and the Vendor Assignments app. The map has no
+     sign-in and no error a viewer can act on, so the file fallback is load-
+     bearing, not decorative: these tests exist to keep it that way.           */
+
+  await test('the document is read from the database when it answers', async () => {
+    const w = await boot();
+    eq(S(w).meta.source, 'database', 'should have used the database');
+    assert(S(w).meta.publishedAt, 'the publish timestamp should be carried through');
+    eq(S(w).communities.length, 71, 'all fixture communities should load');
+    assert(!/offline copy/.test(w.document.getElementById('update-info').innerHTML),
+           'the offline-copy warning must not appear when the database was used');
+  });
+
+  /* ── what an unauthenticated visitor can reach ────────────────────────────
+     This database is shared with Vendor Assignments, Takeoff Flow, Community-DB
+     and Blueprint, and all five apps publish the same anon key. The map is the
+     only one with no sign-in, so it is the one that decides what the internet can
+     see. These assertions guard the client half; map_supabase_setup.sql asserts
+     the server half on every run.                                             */
+
+  await test('the page reads a narrow view, never the underlying table', async () => {
+    const w = await boot();
+    const dbCalls = w.__requested.filter(u => /\/rest\/v1\//.test(u));
+    eq(dbCalls.length, 1, 'exactly one database request');
+    assert(/\/rest\/v1\/map_public\?/.test(dbCalls[0]),
+           `should read the map_public view, got: ${dbCalls[0]}`);
+    assert(!/\/rest\/v1\/map_data/.test(dbCalls[0]),
+           'the base table must never be requested from an unauthenticated page');
+  });
+
+  await test('only the columns the map renders are requested', async () => {
+    const w = await boot();
+    const call = w.__requested.find(u => /\/rest\/v1\//.test(u));
+    const select = decodeURIComponent((call.match(/select=([^&]+)/) || [])[1] || '');
+    eq(select.split(',').sort().join(','), 'payload,people,updated_at',
+       'the select list should be exactly the three columns the page uses');
+    // updated_by is a staff email address. It has no place on a page with no
+    // sign-in, and the view does not expose it either.
+    assert(!/updated_by/.test(call), 'updated_by must not be requested');
+    assert(!/prev_payload|prev_people/.test(call),
+           'the rollback copies must not be requested');
+  });
+
+  await test('no other table in the shared database is ever contacted', async () => {
+    const w = await boot();
+    const other = w.__requested.filter(u =>
+      /division_data|flow_rows|cdb_cis|app_roles|hub_apps|change_log|takeoff_changes/.test(u));
+    eq(other.join(', '), '', 'the map must not touch any sibling app\'s tables');
+  });
+
+  await test('an unreachable database falls back to the committed files and says so', async () => {
+    const w = await boot({ dbFail: true });
+    eq(S(w).meta.source, 'files', 'should have fallen back to the files');
+    eq(S(w).communities.length, 71, 'the map must still render from the fallback');
+    assert(/offline copy/.test(w.document.getElementById('update-info').innerHTML),
+           'the header should disclose that this is the offline copy');
+    assert(S(w).meta.fellBackBecause, 'the reason for falling back should be recorded');
+  });
+
+  await test('a hanging database request aborts and falls back rather than waiting', async () => {
+    // Without the AbortController the page would sit on the network indefinitely
+    // and the fallback would never run — a blank map instead of a stale one.
+    const w = await boot({ dbHang: true, timeoutMs: 40 });
+    eq(S(w).meta.source, 'files', 'a hung request should fall back');
+    assert(/no response within/.test(S(w).meta.fellBackBecause || ''),
+           `expected a timeout reason, got: ${S(w).meta.fellBackBecause}`);
+  });
+
+  /* ── communities with no coordinates ──────────────────────────────────────
+     The old Node importer left a new community at lat/lon null and told the
+     operator to run validate.js --fix before committing. A publish from Blueprint
+     has no such checkpoint, and buildGroups() averages coordinates, so one null
+     coerced to 0 dragged a whole development's pin into the Atlantic.          */
+
+  await test('a community with null coordinates is held off the map, not plotted at 0,0', async () => {
+    const w = await boot({ dbMutate: row => {
+      row.payload.communities[0] = Object.assign({}, row.payload.communities[0],
+        { name: 'Nowhere Ranch', lat: null, lon: null });
+    } });
+    const st = S(w);
+    eq(st.communities.length, 70, 'the unplaceable community should be excluded');
+    eq(st.unlocated.length, 1, 'and counted as unlocated');
+    eq(st.unlocated[0].name, 'Nowhere Ranch', 'the right record should be held back');
+    assert(!st.communities.some(c => c.name === 'Nowhere Ranch'),
+           'it must not appear among the plotted communities');
+    // The real bug this prevents: a null in the centroid average.
+    assert(st.groups.every(g => Number.isFinite(g.lat) && Number.isFinite(g.lon)),
+           'every group centroid must be a finite number');
+  });
+
+  await test('0,0 is treated as unplaceable rather than as a location', async () => {
+    const w = await boot({ dbMutate: row => {
+      row.payload.communities[0] = Object.assign({}, row.payload.communities[0],
+        { name: 'Null Island', lat: 0, lon: 0 });
+    } });
+    eq(S(w).unlocated.length, 1, '0,0 should be rejected — it is what a null becomes');
+    eq(S(w).unlocated[0].name, 'Null Island', 'the right record should be held back');
+  });
+
+  await test('unlocated communities are disclosed in the header, by name', async () => {
+    const w = await boot({ dbMutate: row => {
+      row.payload.communities[0] = Object.assign({}, row.payload.communities[0],
+        { name: 'Nowhere Ranch', lat: null, lon: null });
+    } });
+    const html = w.document.getElementById('update-info').innerHTML;
+    assert(/awaiting a location/.test(html), 'the header should flag the omission');
+    assert(/1 community awaiting/.test(html), `singular wording expected, got: ${html}`);
+    assert(/Nowhere Ranch/.test(html), 'the tooltip should name which community');
+  });
+
+  await test('all-unlocated reports why, instead of looking like empty data', async () => {
+    const w = await boot({ dbMutate: row => {
+      row.payload.communities = row.payload.communities.map(
+        c => Object.assign({}, c, { lat: null, lon: null }));
+    } });
+    await new Promise(r => setTimeout(r, 120));
+    eq(w.document.querySelector('#load-error').style.display, 'flex', 'error panel should be shown');
+    const msg = w.document.querySelector('.load-error-msg').textContent;
+    assert(/none has usable coordinates/.test(msg),
+           `expected the coordinate-specific message, got: ${msg}`);
+    assert(/Blueprint/.test(w.document.querySelector('.load-error-detail').textContent),
+           'the detail should say where to fix it');
   });
 
   /* ── regressions found in review ──────────────────────────────────────── */

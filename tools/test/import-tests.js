@@ -316,9 +316,9 @@ test('unused trade categories and vendors are pruned', () => {
   assert(d.tradeCats.includes('Roofing Turnkey'), 'used category should remain');
 });
 
-test('a run that would gut the community list is refused', () => {
+test('a stale workbook cannot delete the communities it omits', () => {
   const e = env();
-  // Pad the existing data out so the ratio is a real test rather than 2 → 1.
+  // Pad the existing data out so this is a real test rather than 2 → 1.
   const d = JSON.parse(fs.readFileSync(e.dp, 'utf8'));
   for (let i = 0; i < 6; i++) {
     d.communities.push({
@@ -329,8 +329,15 @@ test('a run that would gut the community list is refused', () => {
   fs.writeFileSync(e.dp, JSON.stringify(d));
   const before = d.communities.length; // 8
 
-  // Both workbooks supplied, but between them they mention only one community —
-  // the signature of someone picking last quarter's file.
+  /* Both workbooks supplied, but between them they mention only one community —
+     the signature of someone picking last quarter's file.
+
+     This used to be refused by a shrink guard, because the union of the two
+     workbooks was authoritative and everything else was deleted. It is not
+     refused now, because nothing is deleted: an import adds and decorates, and a
+     community with no start in the window is dormant rather than gone. Its
+     coordinates, utilities and contacts exist nowhere else, so losing them to a
+     quiet quarter was the more expensive failure. */
   const starts = book('Start Log', [
     { Comm: 'Alpha Ridge', Job: '11110000123', 'Start (Prj)': dayIn(0, 5), 'Start (Act)': null }
   ]);
@@ -339,9 +346,55 @@ test('a run that would gut the community list is refused', () => {
       'Supplier Desc': 'Proformance Roofing', 'Trade Desc.': 'Roofing Turnkey', 'Expired Date': null }
   ]);
   const r = run(e, { starts, re2 });
-  eq(r.code, 1, 'should refuse');
-  assert(/over half/.test(r.out), `should explain:\n${r.out}`);
-  eq(load(e).communities.length, before, 'the file must be untouched');
+  eq(r.code, 0, 'should succeed rather than refuse');
+  eq(load(e).communities.length, before, 'every community must survive');
+  assert(/no starts in this window/.test(r.out),
+         `the omitted ones should be reported as dormant:\n${r.out}`);
+
+  // Their coordinates — which exist in no workbook — must be intact.
+  const filler = load(e).communities.find(c => c.name === 'Filler 0');
+  eq(filler.lat, 28.5, 'a dormant community keeps its coordinates');
+});
+
+test('the RE2 export cannot introduce a community the map does not have', () => {
+  const e = env();
+  const before = load(e).communities.length;
+  // The real export lists every community the division has ever had — 576 for
+  // Orlando against the 71 on the map — so letting it define existence pulled in
+  // five hundred closed-out communities with no coordinates.
+  const re2 = book('Sheet1', [
+    { Division: 'OLH', Community: '11110000000', Description: 'Alpha Ridge',
+      'Supplier Desc': 'Proformance Roofing', 'Trade Desc.': 'Roofing Turnkey', 'Expired Date': null },
+    { Division: 'OLH', Community: '77770000000', Description: 'Closed Out Estates',
+      'Supplier Desc': 'Proformance Roofing', 'Trade Desc.': 'Roofing Turnkey', 'Expired Date': null }
+  ]);
+  const r = run(e, { re2 });
+  eq(r.code, 0, 'should succeed');
+  const d = load(e);
+  eq(d.communities.length, before, 'no community was added');
+  assert(!d.communities.some(c => c.name === 'Closed Out Estates'),
+         'the unknown community must not appear');
+  assert(/1 communities in the export are not on the map/.test(r.out),
+         `and the count should be reported:\n${r.out}`);
+});
+
+test('a 10-digit job number resolves to the same community as an 11-digit one', () => {
+  const e = env();
+  /* 485 of the 6,674 jobs in the real Orlando permit log carry a 3-digit lot
+     rather than a 4-digit one. Under the old >=11 rule every one of them fell
+     through unnormalised and became its own community — Hunt Club 40GC alone
+     split into 208 — taking the division from 94 communities to 575. */
+  const starts = book('Start Log', [
+    { Comm: 'Alpha Ridge', Job: '11110000123', 'Start (Prj)': dayIn(0, 5), 'Start (Act)': null },
+    { Comm: 'Alpha Ridge', Job: '1111000456',  'Start (Prj)': dayIn(0, 6), 'Start (Act)': null },
+    { Comm: 'Alpha Ridge', Job: '1111000789',  'Start (Prj)': dayIn(0, 7), 'Start (Act)': null }
+  ]);
+  const r = run(e, { starts });
+  eq(r.code, 0, 'should succeed');
+  const d = load(e);
+  const alphas = d.communities.filter(c => c.name === 'Alpha Ridge');
+  eq(alphas.length, 1, 'all three lots belong to one community, not three');
+  eq(alphas[0].starts.reduce((a, b) => a + b, 0), 3, 'and all three starts land on it');
 });
 
 test('--dry-run writes nothing', () => {

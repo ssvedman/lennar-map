@@ -799,6 +799,42 @@
 // line of application code. See README.
 // ─────────────────────────────────────────────
 
+// The document now lives in Supabase (table map_data, read through the map_public
+// view), so one upload in Blueprint
+// can feed this map and the Vendor Assignments app from the same two workbooks
+// instead of each being imported separately.
+//
+// The committed data.json / people.json stay in the repo and stay the fallback.
+// That is not laziness about deleting them — the map has no sign-in and no error
+// path a viewer can act on, so "the database is unreachable" must not mean "the
+// page is blank". A stale-but-present map is strictly better than a dead one, and
+// the header says which source it came from.
+//
+// Plain fetch against PostgREST rather than supabase-js: reads are one GET with
+// two headers, and this page's only other dependency is Leaflet, vendored with an
+// integrity hash. Adding a CDN library to serve one query would be a poor trade.
+const MAP_DB = {
+  url:  'https://memhzqphludiruovuzwt.supabase.co',
+
+  // The anon key. It is public — every sibling app already publishes the same one
+  // in its own config.js — so it is not a secret and nothing is protected by
+  // hiding it. What protects the database is that `anon` has no privileges on any
+  // table in it. This key can read exactly one object, the map_public view below,
+  // and nothing else: not division_data, not flow_rows, not cdb_cis, not the role
+  // tables. See map_supabase_setup.sql, which asserts that on every run.
+  key:  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1lbWh6cXBobHVkaXJ1b3Z1end0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQyMTI3MjUsImV4cCI6MjA5OTc4ODcyNX0.hTJBtb3WtkgY66xqzZ22GT7V4VNllxPyb4C7qXRFFVI',
+
+  // A view, not the table. It projects only the columns this page renders, so the
+  // rollback copies and the publisher's email address are not reachable from an
+  // unauthenticated page.
+  from: 'map_public',
+  row:  'orlando',
+
+  // A hung request is worse than a failed one: without a deadline the map waits
+  // on the network indefinitely and the fallback never runs.
+  timeoutMs: 8000
+};
+
 const DATA_URL   = 'data.json';
 const PEOPLE_URL = 'people.json';
 
@@ -837,13 +873,73 @@ let ACM_CONTACTS = {};
 let dataStart = null;
 let meta = {};
 
+// Communities that arrived without usable coordinates. They are held out of
+// `communities` entirely rather than plotted, because every consumer downstream
+// assumes lat/lon are numbers: buildGroups() averages them, so a single null
+// coerces to 0 and drags a whole development's pin into the Atlantic. Silently
+// wrong beats loudly broken only if you never look at the map.
+//
+// This became reachable when imports moved into Blueprint. The old Node importer
+// created a new community with lat/lon null and printed a reminder to run
+// tools/validate.js --fix by hand before committing; a browser publish has no such
+// checkpoint, so the map has to defend itself.
+let unlocated = [];
+
 function esc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-async function loadData() {
+// Read the published document out of Supabase. Returns null on any failure —
+// unreachable, unauthorized, empty table, malformed row — because every one of
+// those has the same remedy from the page's point of view: use the files instead.
+// The reason is reported so the header can distinguish "fell back" from "fine".
+async function loadFromDb() {
+  if (!MAP_DB.url || !MAP_DB.key) return null;
+
+  // Reads are cheap and the payload is ~100 KB, so ask for exactly the columns
+  // the page uses. vnd.pgrst.object+json makes PostgREST return the single row
+  // as an object and 406 if there isn't exactly one, which turns "no row yet"
+  // into an ordinary failure rather than an empty array to special-case.
+  //
+  // updated_by is deliberately not requested and not exposed by the view: it is a
+  // staff email address, and this page is open to anyone.
+  const url = `${MAP_DB.url}/rest/v1/${MAP_DB.from}`
+            + `?key=eq.${encodeURIComponent(MAP_DB.row)}`
+            + `&select=payload,people,updated_at`;
+
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), MAP_DB.timeoutMs);
+  try {
+    const r = await fetch(url, {
+      signal: ctl.signal,
+      cache: 'no-store',
+      headers: {
+        apikey: MAP_DB.key,
+        Authorization: `Bearer ${MAP_DB.key}`,
+        Accept: 'application/vnd.pgrst.object+json'
+      }
+    });
+    if (!r.ok) return { error: `${MAP_DB.from}: HTTP ${r.status}` };
+    const row = await r.json();
+    if (!row || !row.payload) return { error: `${MAP_DB.from}: row has no payload` };
+    return {
+      data: row.payload,
+      people: row.people || { people: {} },
+      publishedAt: row.updated_at || null
+    };
+  } catch (err) {
+    return { error: err && err.name === 'AbortError'
+      ? `${MAP_DB.from}: no response within ${MAP_DB.timeoutMs} ms`
+      : `${MAP_DB.from}: ${err && err.message || err}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// The original loader, unchanged in behaviour, now used as the fallback.
+async function loadFromFiles() {
   // cache: 'no-cache' revalidates on every load rather than bypassing the cache.
   // The data changes weekly, so an unchanged file comes back as a 304 with no
   // body — always current, without re-downloading ~100 KB on every page view.
@@ -858,12 +954,34 @@ async function loadData() {
     }),
     fetch(PEOPLE_URL, opts).then(r => (r.ok ? r.json() : { people: {} })).catch(() => ({ people: {} }))
   ]);
+  return { data, people: ppl };
+}
+
+async function loadData() {
+  let source = 'database';
+  let fellBackBecause = null;
+  let publishedAt = null;
+
+  let got = await loadFromDb();
+  if (!got || got.error) {
+    fellBackBecause = got && got.error ? got.error : 'database not configured';
+    source = 'files';
+    got = await loadFromFiles();   // if this throws, init() reports it as fatal
+  } else {
+    publishedAt = got.publishedAt;
+  }
+
+  const data = got.data;
+  const ppl  = got.people || { people: {} };
 
   PEOPLE = ppl.people || {};
   dataStart = data.dataStart;
   meta = {
     generatedAt: data.generatedAt,
-    updateCadenceDays: data.updateCadenceDays || 7
+    updateCadenceDays: data.updateCadenceDays || 7,
+    source,
+    fellBackBecause,
+    publishedAt
   };
 
   const cats = data.tradeCats || [];
@@ -896,6 +1014,14 @@ async function loadData() {
     }
     return rec;
   });
+
+  // Split off anything that cannot be placed. 0,0 counts as unplaceable, not as a
+  // location: it is what a null becomes after arithmetic, and it is in the Gulf of
+  // Guinea, so treating it as real coordinates is never right.
+  const placeable = c => Number.isFinite(c.lat) && Number.isFinite(c.lon)
+                      && !(c.lat === 0 && c.lon === 0);
+  unlocated   = communities.filter(c => !placeable(c));
+  communities = communities.filter(placeable);
 }
 
 // ─────────────────────────────────────────────
@@ -1009,7 +1135,22 @@ function renderFreshness() {
     `<span>Last updated: <b>${esc(fmt(gen))}</b></span>` +
     (overdue
       ? `<span class="stale" title="Expected an update on ${esc(fmt(next))}">⚠ ${Math.floor(ageDays)} days old — update overdue</span>`
-      : `<span>Next update: <b>${esc(fmt(next))}</b></span>`);
+      : `<span>Next update: <b>${esc(fmt(next))}</b></span>`) +
+
+    // Serving the committed files means a publish may have happened that this
+    // page cannot see, so say so rather than showing a confidently stale date.
+    (meta.source === 'files'
+      ? `<span class="stale" title="${esc(meta.fellBackBecause || '')}">⚠ showing the offline copy</span>`
+      : '') +
+
+    // A community with no coordinates is absent from the map, the counts and the
+    // exports. That has to be visible: the failure mode this replaces was a pin
+    // silently landing at 0,0, and an invisible omission is no better.
+    (unlocated.length
+      ? `<span class="stale" title="${esc(unlocated.map(c => c.name).join(', '))}">`
+        + `⚠ ${unlocated.length} ${unlocated.length === 1 ? 'community' : 'communities'} `
+        + `awaiting a location</span>`
+      : '');
 }
 
 // ─────────────────────────────────────────────
@@ -1837,7 +1978,17 @@ function fatal(msg, detail) {
   }
 
   if (!communities.length) {
-    fatal('Community data loaded but contained no communities.', 'Check data.json.');
+    // Distinguish "no data" from "data arrived but nothing could be placed" —
+    // they look identical on screen and have completely different causes.
+    fatal(
+      unlocated.length
+        ? `Loaded ${unlocated.length} communities, but none has usable coordinates.`
+        : 'Community data loaded but contained no communities.',
+      unlocated.length
+        ? 'Every record is missing lat/lon. Set coordinates in Blueprint (Data Intake → '
+          + 'awaiting a location), or run tools/validate.js --fix against data.json.'
+        : `Source was the ${meta.source === 'files' ? 'committed data.json' : 'map_data table'}.`
+    );
     return;
   }
 
