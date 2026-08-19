@@ -214,11 +214,46 @@ async function boot(opts = {}) {
 
   await test('co-located communities collapse to one pin', () => {
     eq(S().communities.length, 71, 'sanity');
-    eq(S().groups.length, 40, 'group count at a 250 m radius');
+    eq(S().groups.length, 30, 'group count');
     const merged = S().groups.filter(g => g.members.length > 1);
-    eq(merged.length, 14, 'merged group count');
+    eq(merged.length, 15, 'merged group count');
     assert(S().groups.every(g => g.members.length >= 1), 'every group needs members');
     eq(S().groups.reduce((a, g) => a + g.members.length, 0), 71, 'every community must land in exactly one group');
+  });
+
+  await test('every phase of a development lands on one pin', () => {
+    // Distance alone stranded these: Waterlin 50 is 301 m from its nearest
+    // sibling and Wellness 50GC 599 m, both past the old 250 m radius.
+    const nameOf = i => S().communities[i].name;
+    const groupNames = S().groups.map(g => g.members.map(nameOf));
+    for (const dev of ['Waterlin', 'Wellness', 'Springhead', 'Westview', 'Ranches',
+                       'Crossprairie', 'Sugarloaf', 'Hunt Club', 'Pine Meadows',
+                       'Scenic Terr', 'Grenelefe', 'Crosswinds', 'Reedy']) {
+      const all = S().communities.filter(c => c.name.startsWith(dev)).map(c => c.name);
+      const holding = groupNames.filter(g => g.some(n => all.includes(n)));
+      eq(holding.length, 1, `${dev} should occupy exactly one pin (${all.length} phases)`);
+      for (const n of all) assert(holding[0].includes(n), `${n} missing from the ${dev} pin`);
+    }
+  });
+
+  await test('one development spelled two ways still merges, on distance', () => {
+    const nameOf = i => S().communities[i].name;
+    const gn = S().groups.map(g => g.members.map(nameOf));
+    const together = (a, b) => gn.some(g => g.includes(a) && g.includes(b));
+    assert(together('Meadowpointe 50', 'Hidden Ridge 50'), 'Meadowpointe / Hidden Ridge');
+    assert(together('Prov Garden 60', 'Providence 50GC'), 'Prov Garden / Providence');
+  });
+
+  await test('unrelated developments are not merged', () => {
+    const nameOf = i => S().communities[i].name;
+    const gn = S().groups.map(g => g.members.map(nameOf));
+    const together = (a, b) => gn.some(g => g.includes(a) && g.includes(b));
+    assert(!together('Waterlin 45', 'Wellness 32'), 'Waterlin must not absorb Wellness');
+    assert(!together('Sugarloaf 45', 'Hunt Club 50'), 'Sugarloaf must not absorb Hunt Club');
+    assert(!together('Crossprairie 25', 'Crosswinds TH'), 'similar prefixes must stay apart');
+    const singles = S().groups.filter(g => g.members.length === 1).map(g => nameOf(g.members[0]));
+    assert(singles.includes('Woodland Ranch'), 'Woodland Ranch should stand alone');
+    assert(singles.includes('Villa Mar 40'), 'Villa Mar should stand alone');
   });
 
   await test('the two exact-duplicate coordinate pairs are merged', () => {
@@ -242,8 +277,36 @@ async function boot(opts = {}) {
     assert(shown > S().groups.length, 'the list must not be collapsed the way the pins are');
   });
 
+  await test('a large group gets a dropdown instead of a wall of tabs', () => {
+    // Wellness has thirteen phases; as tabs that wrapped to five rows.
+    const gi = S().groups.findIndex(g => g.visible.size > 6);
+    assert(gi >= 0, 'expected a group past the tab limit');
+    const el = S().markers[gi].openPopup()._rendered;
+    eq(el.querySelectorAll('.popup-tab').length, 0, 'should not render tabs');
+    const sel = el.querySelector('.popup-tab-select');
+    assert(sel, 'should render a select');
+    eq(sel.options.length, win.visibleMembers(gi).length, 'one option per visible member');
+  });
+
+  await test('choosing from the dropdown swaps the body', () => {
+    const gi = S().groups.findIndex(g => g.visible.size > 6);
+    const el = S().markers[gi].openPopup()._rendered;
+    const sel = el.querySelector('.popup-tab-select');
+    const target = sel.options[sel.options.length - 1];
+    sel.value = target.value;
+    sel.dispatchEvent(new win.Event('change', { bubbles: true }));
+    eq(el.querySelector('.popup-name').textContent, target.textContent, 'body should follow the dropdown');
+  });
+
+  await test('a small group still gets tabs', () => {
+    const gi = S().groups.findIndex(g => g.visible.size > 1 && g.visible.size <= 6);
+    const el = S().markers[gi].openPopup()._rendered;
+    eq(el.querySelectorAll('.popup-tab-select').length, 0, 'should not render a select');
+    eq(el.querySelectorAll('.popup-tab').length, win.visibleMembers(gi).length, 'one tab per member');
+  });
+
   await test('a merged pin opens one popup with a tab per community', () => {
-    const gi = S().groups.findIndex(g => g.visible.size > 3);
+    const gi = S().groups.findIndex(g => g.visible.size > 3 && g.visible.size <= 6);
     const el = S().markers[gi].openPopup()._rendered;
     const tabs = el.querySelectorAll('.popup-tab');
     // Tabs track the members that survived the filter, not every member — a
@@ -262,7 +325,7 @@ async function boot(opts = {}) {
   });
 
   await test('clicking a popup tab swaps the body to that community', () => {
-    const gi = S().groups.findIndex(g => g.visible.size > 2);
+    const gi = S().groups.findIndex(g => g.visible.size > 2 && g.visible.size <= 6);
     const el = S().markers[gi].openPopup()._rendered;
     const tabs = [...el.querySelectorAll('.popup-tab')];
     const target = tabs[tabs.length - 1];
@@ -435,7 +498,7 @@ async function boot(opts = {}) {
   await test('clicking a merged pin keeps popup, panel, sidebar and URL in step', async () => {
     const w = await boot();
     const st = () => w.__state();
-    const gi = st().groups.findIndex(g => g.visible.size > 2);
+    const gi = st().groups.findIndex(g => g.visible.size > 2 && g.visible.size <= 6);
     const mk = st().markers[gi];
 
     // Open it and choose the last tab, so the remembered selection is not the

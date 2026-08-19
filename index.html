@@ -83,7 +83,10 @@
     display: flex;
     gap: 6px;
     margin-top: 10px;
-    flex-wrap: wrap;
+    /* One row. Labels are short enough for all four to fit the 300px sidebar;
+       wrapping used to drop the CSV button onto a line of its own. */
+    flex-wrap: nowrap;
+    align-items: center;
   }
   #basemap-switcher {
     position: absolute;
@@ -115,7 +118,7 @@
     padding: 3px 0;
   }
   .filter-btn {
-    padding: 4px 10px;
+    padding: 4px 9px;
     border-radius: 20px;
     border: 1px solid #cbd5e1;
     background: #fff;
@@ -641,8 +644,25 @@
     font-size: 10px; font-weight: 600;
   }
 
-  .filter-btn.export-btn { margin-left: auto; }
+  .filter-btn.export-btn { margin-left: auto; flex-shrink: 0; }
   .filter-btn.export-btn:hover { border-color: #0f766e; color: #0f766e; }
+
+  /* Dropdown replacing the tab row once a pin covers more than TAB_LIMIT
+     communities — one line high regardless of how many there are. */
+  .popup-tab-select {
+    width: 100%;
+    margin-bottom: 9px;
+    padding: 5px 8px;
+    border: 1px solid #cbd5e1;
+    border-radius: 5px;
+    background: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    color: #0D1B2A;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .popup-tab-select:focus { outline: none; border-color: #2563EB; }
 
   /* Shown only when data or the map library cannot be loaded at all. */
   #load-error {
@@ -661,7 +681,6 @@
 
   @media (max-width: 767px) {
     #header .hdr-logo { width: 24px; height: 24px; }
-    .popup-tabs-row { max-height: 84px; overflow-y: auto; }
   }
 </style>
 </head>
@@ -697,8 +716,8 @@
       <input id="search" type="text" placeholder="Search community, city, plan, or #…"/>
       <div id="filter-row">
         <button class="filter-btn active" data-filter="all">All</button>
-        <button class="filter-btn" data-filter="active">Active starts</button>
-        <button class="filter-btn" data-filter="next3">Next 3 months</button>
+        <button class="filter-btn" data-filter="active">Active</button>
+        <button class="filter-btn" data-filter="next3">Next 3 mo</button>
         <button class="filter-btn export-btn" id="export-btn" title="Download the communities currently shown, as CSV">↓ CSV</button>
       </div>
     </div>
@@ -783,19 +802,34 @@
 const DATA_URL   = 'data.json';
 const PEOPLE_URL = 'people.json';
 
-// Communities closer together than this collapse into a single map pin. Phases
-// of one development sit within a few hundred metres of each other and used to
-// render as a scatter of overlapping dots — at the extreme, two pairs shared an
-// exact coordinate, so one pin sat permanently underneath another and could
-// never be clicked. 250 m groups the phases of a development without merging
-// genuinely separate ones.
+// Communities are grouped onto one pin when they belong to the same
+// development. Distance alone was tried first and is the wrong model: phases are
+// laid out along roads, so any radius cuts somewhere arbitrary. Waterlin 50 sits
+// 301 m from its nearest sibling and Wellness 50GC 599 m, so a 250 m rule
+// stranded both on their own pins while grouping the rest of their development.
 //
-// Note this is a single-link radius, not a group diameter: a community joins if
-// it is within 250 m of ANY member, so a chain of phases laid out along a road
-// can span further than that. On the current data the widest group reaches about
-// 485 m end to end. "Get Directions" always uses the community's own
-// coordinates, so navigation is unaffected by the pin sitting at the centroid.
-const MERGE_RADIUS_M = 250;
+// The community names already carry the answer — "Waterlin 50" is obviously a
+// Waterlin — so the development name is the primary key, and distance only fills
+// in the two cases where one development is spelled two ways
+// (Meadowpointe/Hidden Ridge, Prov Garden/Providence).
+const MERGE_RADIUS_M = 400;
+
+// Same-named communities still have to be plausibly near each other, so a future
+// development reusing a name in another county cannot silently merge into this
+// one.
+const SAME_NAME_MAX_M = 25000;
+
+// Trailing size/type designators, stripped to leave the development name:
+//   Waterlin 40RL · Wellness2 40FL · Hunt Club 50GC · Reedy 50 Classic
+//   Westview Villa · Edgewater MJR · Crosswinds 2 50 · Grenelefe 60M
+const DESIGNATOR = /^(\d+[a-z]*|th|gc|aa|rl|fl|mjr|m|villa|classic|majors)$/i;
+
+function developmentOf(name) {
+  const t = String(name).split(/\s+/);
+  while (t.length > 1 && DESIGNATOR.test(t[t.length - 1])) t.pop();
+  // Trailing digit on the base word marks a later phase: "Wellness2" is Wellness.
+  return t.join(' ').replace(/\d+$/, '').trim().toLowerCase();
+}
 
 let communities = [];
 let PEOPLE = {};
@@ -1055,9 +1089,17 @@ function metresBetween(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-// Single-link clustering: a community joins a group if it is within the radius
-// of any member, not just the first. Phases laid out along a road chain together
-// as one development rather than splitting on where the scan happened to start.
+// Two communities belong on the same pin if they are the same development, or
+// simply close enough that separate pins would overlap.
+function sameGroup(a, b) {
+  const d = metresBetween(a, b);
+  if (developmentOf(a.name) === developmentOf(b.name)) return d <= SAME_NAME_MAX_M;
+  return d <= MERGE_RADIUS_M;
+}
+
+// Single-link clustering: a community joins a group if it relates to any member,
+// not just the first, so a development chains together whatever order it is
+// scanned in.
 function buildGroups() {
   groups = [];
   groupOf = new Array(communities.length);
@@ -1072,7 +1114,7 @@ function buildGroups() {
       grew = false;
       for (let j = 0; j < communities.length; j++) {
         if (taken[j]) continue;
-        if (members.some(k => metresBetween(communities[k], communities[j]) <= MERGE_RADIUS_M)) {
+        if (members.some(k => sameGroup(communities[k], communities[j]))) {
           members.push(j); taken[j] = true; grew = true;
         }
       }
@@ -1265,7 +1307,8 @@ function buildPopupHTML(c) {
 }
 
 // A merged pin opens one popup with a tab per community rather than stacking
-// several popups on the same point.
+// several popups on the same point. Past this many, tabs become a dropdown.
+const TAB_LIMIT = 6;
 let popupSelection = {}; // group -> community idx
 
 function buildGroupPopup(g) {
@@ -1278,26 +1321,45 @@ function buildGroupPopup(g) {
   let sel = popupSelection[g];
   if (sel == null || !vis.includes(sel)) sel = vis[0];
 
-  const tabs = document.createElement('div');
-  tabs.className = 'popup-tabs';
-  tabs.innerHTML =
-    `<div class="popup-tabs-label">${vis.length} communities at this location</div>` +
-    `<div class="popup-tabs-row">` +
-    vis.map(i => `<button class="popup-tab${i === sel ? ' active' : ''}" data-idx="${i}">${esc(communities[i].name)}</button>`).join('') +
-    `</div>`;
-
   const body = document.createElement('div');
   body.innerHTML = buildPopupHTML(communities[sel]);
 
-  tabs.addEventListener('click', e => {
-    const btn = e.target.closest('.popup-tab');
-    if (!btn) return;
-    const idx = Number(btn.dataset.idx);
+  const choose = idx => {
     popupSelection[g] = idx;
-    tabs.querySelectorAll('.popup-tab').forEach(b => b.classList.toggle('active', Number(b.dataset.idx) === idx));
     body.innerHTML = buildPopupHTML(communities[idx]);
     highlightItem(idx, { openPopup: false, pan: false });
-  });
+  };
+
+  const tabs = document.createElement('div');
+  tabs.className = 'popup-tabs';
+
+  // Tabs stop working as tabs past about half a dozen: Wellness has thirteen
+  // phases, which wrapped to five rows and pushed the community itself off the
+  // screen. Above the threshold this becomes a dropdown, which is one line
+  // regardless of count and gets a native picker on a phone.
+  if (vis.length > TAB_LIMIT) {
+    tabs.innerHTML =
+      `<div class="popup-tabs-label">${vis.length} communities at this location</div>` +
+      `<select class="popup-tab-select">` +
+      vis.map(i => `<option value="${i}"${i === sel ? ' selected' : ''}>${esc(communities[i].name)}</option>`).join('') +
+      `</select>`;
+    tabs.addEventListener('change', e => {
+      if (e.target.classList.contains('popup-tab-select')) choose(Number(e.target.value));
+    });
+  } else {
+    tabs.innerHTML =
+      `<div class="popup-tabs-label">${vis.length} communities at this location</div>` +
+      `<div class="popup-tabs-row">` +
+      vis.map(i => `<button class="popup-tab${i === sel ? ' active' : ''}" data-idx="${i}">${esc(communities[i].name)}</button>`).join('') +
+      `</div>`;
+    tabs.addEventListener('click', e => {
+      const btn = e.target.closest('.popup-tab');
+      if (!btn) return;
+      const idx = Number(btn.dataset.idx);
+      tabs.querySelectorAll('.popup-tab').forEach(b => b.classList.toggle('active', Number(b.dataset.idx) === idx));
+      choose(idx);
+    });
+  }
 
   wrap.appendChild(tabs);
   wrap.appendChild(body);
