@@ -1,0 +1,15 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Node — the tools here are dependency-free on purpose; this is only here so a
+# stray install cannot get committed.
+node_modules/
+npm-debug.log*
+
+# Local scratch
+*.local.json
+tmp/

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" fill="none" role="img" aria-label="Community Map">
+  <rect width="48" height="48" rx="10" fill="#0a2540"/>
+  <!-- the same faint blueprint graticule the hub mark uses -->
+  <g stroke="#1c3d5f" stroke-width="1">
+    <path d="M12 19h24M12 29h24M20 11v26M28 11v26"/>
+  </g>
+  <!-- folded division map: the plotted area -->
+  <path d="M12 31V17l9-4 6 4 9-3v14l-9 3-6-4-9 4Z" stroke="#4d92e0" stroke-width="2.4"
+        stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M21 13v14M27 17v14" stroke="#4d92e0" stroke-width="1.4" opacity=".55"/>
+  <!-- communities, sized by starts — the map's own legend -->
+  <circle cx="16.5" cy="24" r="3.4" fill="#eaf2fc"/>
+  <circle cx="31.5" cy="21.5" r="2.6" fill="#4d92e0"/>
+  <circle cx="24" cy="28.5" r="1.8" fill="#0057b8"/>
+</svg>

@@ -1,0 +1,20 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Generated data. Marked so a weekly rewrite does not dominate a diff view or a
+# language breakdown; it is still versioned and still reviewable with `git diff`.
+data.json   linguist-generated=true
+people.json linguist-generated=true
+
+# Third-party library, committed deliberately so the map does not depend on a CDN.
+# Marked vendored so it stays out of language stats and collapses in diffs.
+vendor/** linguist-vendored=true
+
+# -text disables end-of-line normalization for the vendored library, and it is
+# load-bearing rather than cosmetic. index.html pins both files with a SHA-384
+# integrity hash. leaflet.css ships with CRLF endings; under the `* text=auto`
+# rule above, git would rewrite them to LF on commit, the bytes served would no
+# longer be the bytes the hash was computed from, and the browser would silently
+# refuse the stylesheet — an unstyled map with no error in the console.
+# Byte-for-byte stability is the whole point here.
+vendor/** -text
