@@ -278,7 +278,23 @@ test('a new community is added with no coordinates and reported', () => {
   assert(/validate\.js --fix/.test(r.out), 'should point at the geocoder');
 });
 
-test('validate.js then fails on the un-geocoded newcomer rather than shipping it', () => {
+test('validate.js reports the un-geocoded newcomer instead of failing the run', () => {
+  /* This used to assert that validate.js EXITS 1 on a community with no
+     coordinate. The intent was right — do not silently ship a community that
+     cannot be placed — but the mechanism was wrong, and it had two costs.
+
+     It made validate.js exit 1 after every single import, because an import's
+     whole job is to introduce communities that have no coordinate yet. A report
+     that always fails is a report nobody reads, and this one carries the
+     geocoding drift warnings that genuinely matter.
+
+     And it was solving a problem that had already moved: the map now holds an
+     unplaceable community off the map and says how many are waiting, so nothing
+     is silently shipped whether or not this script exits non-zero.
+
+     So the assertion is now the intent rather than the old mechanism: the
+     community is reported, the starts it hides are counted, and the run succeeds
+     so that the rest of the output gets read. */
   const e = env();
   run(e, { starts: book('Start Log', [
     { Comm: 'Gamma Park', Job: '33330000001', 'Start (Prj)': dayIn(0, 5), 'Start (Act)': null }
@@ -288,8 +304,16 @@ test('validate.js then fails on the un-geocoded newcomer rather than shipping it
     out = execFileSync(process.execPath,
       [path.join(ROOT, 'tools', 'validate.js'), '--data', e.dp, '--people', e.pp], { encoding: 'utf8' });
   } catch (err) { code = err.status; out = (err.stdout || '') + (err.stderr || ''); }
-  eq(code, 1, 'validate should fail');
-  assert(/lat\/lon is not numeric|missing required field/.test(out), `should flag the coordinate:\n${out}`);
+
+  eq(code, 0, `an expected state must not fail the run:\n${out}`);
+  assert(/awaiting a location/.test(out), `the newcomer should be reported:\n${out}`);
+  assert(/Gamma Park/.test(out), 'by name');
+  assert(!/lat\/lon is present but not numeric/.test(out),
+    'and not mislabelled as a type error');
+
+  // The community must still be in the document — reported, not dropped.
+  const d = load(e);
+  assert(d.communities.some(c => c.name === 'Gamma Park'), 'and kept in the document');
 });
 
 test('dataStart is emitted as the current month', () => {

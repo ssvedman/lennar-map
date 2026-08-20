@@ -11,7 +11,7 @@ index.html      the application
 data.json       offline fallback copy of the community document
 people.json     offline fallback copy of the contacts
 vendor/         Leaflet
-tools/          import, validation, seeding, tests
+tools/          import, locating, validation, seeding, tests
 map_supabase_setup.sql   schema + row-level security for the map_data table
 ```
 
@@ -67,6 +67,7 @@ The Node path still works and is the fallback if Blueprint is unavailable:
 ```
 node tools/import-workbooks.js --re2 RE2.xlsx --starts StartSchedule.xlsx \
                                --contacts "Construction Community Contact.xlsx"
+node tools/locate-communities.js --starts StartSchedule.xlsx   # place new communities
 node tools/validate.js --fix          # geocode drift check
 node tools/seed-supabase.js --key <SERVICE_ROLE_KEY>
 ```
@@ -80,8 +81,36 @@ fallback copy does not drift from what is published.
 A newly imported community arrives with no address and no `lat`/`lon`. Those records are
 held off the map rather than plotted, and the header reports how many are waiting — an
 unplaceable record used to coerce to `0,0` and drag its whole development's pin into the
-Atlantic. Set the coordinates in Blueprint, or fill in the address and run
-`tools/validate.js --fix`.
+Atlantic. Its starts are held back with it, which is the part worth caring about.
+
+`tools/locate-communities.js` places most of them without anyone doing anything. It
+geocodes the **street names** the permit log already carries for every lot — a new
+community's lots read `TBD Sunfish Drive`, so the street is there before the house number
+is — and applies a coordinate only when two of a community's streets agree, or when an
+already-located phase of the same development corroborates a single one. One uncorroborated
+street is reported for confirmation and never written, because a same-named street in
+another town produces exactly that evidence, and a confidently wrong pin is worse than a
+missing one.
+
+```
+node tools/locate-communities.js --starts StartSchedule.xlsx
+node tools/locate-communities.js --starts … --dry-run
+node tools/locate-communities.js --only "Ridgebrooke" --place "28.6607,-81.5458"
+```
+
+What is left over needs a person, and Blueprint is where that happens — Data Intake's map
+card and the Health panel both list what is waiting and take a confirmation, a rejection or
+a typed coordinate. `--place` above is the same operation from the command line, for when
+Blueprint is unavailable.
+
+Every attempt is recorded on the community as `geo`, so a retry is informed rather than
+blind and a proposal you have rejected is not offered again on the same evidence.
+`geoSource` records how a pin was arrived at — `agreement`, `sibling`, `confirmed` or
+`manual`. A hand-placed coordinate is never auto-corrected: `validate.js --fix` will report
+one that disagrees with its own address, but will not move it.
+
+The rules all live in `map-core.js` and are unit-tested without a network. `geo-client.js`
+is the only thing that talks to a geocoder.
 
 ## Tests
 

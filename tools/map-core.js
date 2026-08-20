@@ -150,6 +150,561 @@
      number so it stays meaningful as the map grows. */
   const GROWTH_REFUSE = 2.0;
 
+  /* ========================= LOCATING A NEW COMMUNITY =======================
+
+     A community arrives from the workbooks with no coordinate. Nothing in any
+     workbook supplies one, and until it has one the community is held off the
+     map along with its starts.
+
+     The permit log does carry an Address per lot, so the streets are known even
+     before the house numbers are. What follows turns those streets into a
+     coordinate — and, much more importantly, refuses to when it cannot be sure.
+
+     ── WHY THIS IS SO CONSERVATIVE ───────────────────────────────────────────
+     A geocoder's job is to return its best guess. Ask it for a street that does
+     not exist yet — which is the normal state of a new subdivision — and it will
+     cheerfully return a similarly-spelled street somewhere else in the state. A
+     pin in the wrong place is worse than no pin: no pin is visibly missing and
+     someone fixes it, whereas a wrong pin is believed. Every rule below exists to
+     make a confident wrong answer impossible rather than to maximise hit rate.
+
+     Three independent gates, all of which must pass:
+
+       1. STRICT NAME MATCH. The street the geocoder matched must be the street
+          asked for. Street *types* are normalised (AVENUE ↔ AVE) because those
+          are genuine synonyms; the distinctive words must be equal, token for
+          token. "White Holly" never matches "White Hollow".
+
+       2. INSIDE THE DIVISION. Outside the bounding box, discarded.
+
+       3. CORROBORATION. A single street's coordinate is never trusted on its own,
+          because a same-named street in another town passes gates 1 and 2. It
+          needs either
+            · a second distinct street of the same community landing nearby, or
+            · an already-located sibling community — the other phase of the same
+              development — landing nearby.
+          With neither, the result is offered for confirmation but never applied.
+
+     Of the 94 communities in the Orlando log, 24 have only one street, so gate 3
+     is doing real work rather than covering a rare case. And one community's
+     entire address column reads "TBD" with no street at all, which no amount of
+     cleverness can resolve — it stays pending, and pending is a fine answer.
+     ======================================================================== */
+
+  /* Street types that are the same thing written differently. Normalised so a
+     match on the type alone cannot fail, while leaving the distinctive part of
+     the name to be compared exactly. */
+  const STREET_TYPES = {
+    AVENUE: "AVE", AV: "AVE", AVE: "AVE",
+    BOULEVARD: "BLVD", BLVD: "BLVD",
+    CIRCLE: "CIR", CIR: "CIR",
+    COURT: "CT", CT: "CT",
+    COVE: "CV", CV: "CV",
+    CROSSING: "XING", XING: "XING",
+    DRIVE: "DR", DR: "DR",
+    HIGHWAY: "HWY", HWY: "HWY",
+    LANE: "LN", LN: "LN",
+    LOOP: "LOOP",
+    PARKWAY: "PKWY", PKWY: "PKWY",
+    PASS: "PASS",
+    PATH: "PATH",
+    PLACE: "PL", PL: "PL",
+    POINT: "PT", PT: "PT",
+    RIDGE: "RDG", RDG: "RDG",
+    ROAD: "RD", RD: "RD",
+    RUN: "RUN",
+    SQUARE: "SQ", SQ: "SQ",
+    STREET: "ST", ST: "ST",
+    TERRACE: "TER", TER: "TER",
+    TRAIL: "TRL", TRL: "TRL",
+    WAY: "WAY"
+  };
+
+  // Directional prefixes/suffixes, normalised the same way.
+  const DIRECTIONS = { NORTH: "N", SOUTH: "S", EAST: "E", WEST: "W",
+                       N: "N", S: "S", E: "E", W: "W",
+                       NORTHEAST: "NE", NORTHWEST: "NW",
+                       SOUTHEAST: "SE", SOUTHWEST: "SW",
+                       NE: "NE", NW: "NW", SE: "SE", SW: "SW" };
+
+  /* The street part of a permit-log address. Drops a leading house number, or the
+     "TBD" that stands in for one before lots are numbered. Returns null when
+     there is nothing left — Ridgebrooke's entire address column is the bare word
+     "TBD", and inventing a street from that would be the exact failure this file
+     is written to avoid. */
+  function streetOf(addr) {
+    let s = String(addr == null ? "" : addr).trim();
+    if (!s) return null;
+    s = s.replace(/^(?:tbd|t\.b\.d\.?)\s*/i, "")     // TBD Sunfish Drive
+         /* A house number jammed against the street with no space. The real log
+            has "1928PINE MEADOWS GOLFCOURSE RD", and leaving the number in makes
+            every lot on that road its own street name — so nothing can ever
+            corroborate anything.
+
+            The negative lookahead protects genuinely numbered streets: "42ND ST"
+            must survive intact, so digits followed by an ordinal suffix are left
+            alone. No optional trailing letter here either — allowing one turned
+            "1928PINE" into "INE" by eating the P. */
+         .replace(/^\d+(?!(?:st|nd|rd|th)\b)(?=[a-z])/i, "")   // 1928PINE MEADOWS…
+         .replace(/^\d+[a-z]?\s+/i, "")                        // 1660 Rider Rain Ln
+         .replace(/\s*(?:lot|unit|apt|#)\s*\S+$/i, "")
+         .replace(/\s+/g, " ")
+         .trim();
+    if (!s) return null;
+    // A bare "TBD", or anything with no letters, is not a street.
+    if (/^t\.?b\.?d\.?$/i.test(s)) return null;
+    if (!/[a-z]/i.test(s)) return null;
+    return s.toUpperCase();
+  }
+
+  /* Comparable form of a street name: uppercase tokens, punctuation dropped,
+     types and directions canonicalised. Deliberately NOT fuzzy — no stemming, no
+     edit distance, no dropping of unrecognised words. */
+  function streetKey(street) {
+    const toks = String(street == null ? "" : street)
+      .toUpperCase()
+      .replace(/[^A-Z0-9 ]+/g, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(t => STREET_TYPES[t] || DIRECTIONS[t] || t);
+    return toks.join(" ");
+  }
+
+  /* Is the street a geocoder matched the street that was asked for?
+
+     Equality on the normalised key, with one allowance: a geocoder often returns
+     a street with no type where the source had one, or vice versa. Dropping a
+     trailing type from both sides is safe because the distinctive words still
+     have to match exactly. Nothing else is forgiven. */
+  function sameStreet(asked, matched) {
+    const a = streetKey(asked), b = streetKey(matched);
+    if (!a || !b) return false;
+    if (a === b) return true;
+    const strip = k => {
+      const t = k.split(" ");
+      return (t.length > 1 && Object.values(STREET_TYPES).indexOf(t[t.length - 1]) !== -1)
+        ? t.slice(0, -1).join(" ") : k;
+    };
+    const sa = strip(a), sb = strip(b);
+    // Both must still have a distinctive part left, or "AVE" would match "AVE".
+    return !!sa && !!sb && sa === sb;
+  }
+
+  // Metres between two {lat,lon}. Null-safe: a missing coordinate is not a
+  // position at 0,0, it is the absence of one, so the answer is null.
+  function metresBetween(a, b) {
+    if (!a || !b) return null;
+    if (!Number.isFinite(a.lat) || !Number.isFinite(a.lon)) return null;
+    if (!Number.isFinite(b.lat) || !Number.isFinite(b.lon)) return null;
+    const R = 6371000, rad = x => x * Math.PI / 180;
+    const dp = rad(b.lat - a.lat), dl = rad(b.lon - a.lon);
+    const h = Math.sin(dp / 2) ** 2
+            + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dl / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+
+  // Orlando division. Same box validate.js uses, kept here so the resolver can
+  // reject an out-of-area match without a second source of truth.
+  const BBOX = { minLat: 26.5, maxLat: 30.5, minLon: -83.0, maxLon: -80.0 };
+  const inBox = h => !!h && Number.isFinite(h.lat) && Number.isFinite(h.lon)
+    && h.lat >= BBOX.minLat && h.lat <= BBOX.maxLat
+    && h.lon >= BBOX.minLon && h.lon <= BBOX.maxLon;
+
+  /* Both thresholds are set from the division's actual geometry, not guessed.
+     Measured across the 71 located communities:
+
+       widest span of any one development   1.4 km   (Wellness, 13 phases)
+       typical span                         0.4–0.6 km
+
+     The first guesses were 3 km and 8 km. Those are not "safe" for being
+     generous — a loose radius is what lets an unrelated subdivision corroborate a
+     wrong answer, which is the one failure this whole mechanism exists to
+     prevent. Tightened to roughly double the widest real case, which leaves room
+     for a geocoder returning a block centroid or the far end of a road while
+     staying far too tight to span two different towns.
+
+     If a genuinely wider development ever appears, this will refuse to locate it
+     and say so, which is the right way round: a pending community is visible and
+     fixable, a confidently wrong pin is not. */
+  const AGREE_M = 1500;      // two streets of ONE community
+  const SIBLING_M = 3000;    // another located phase of the same development
+
+  /* Development name, for sibling matching: "Waterlin 40RL" and "Waterlin 50" are
+     both Waterlin. The map's own index.html has the same rule for grouping pins;
+     a test asserts the two agree, since they must. */
+  const DESIGNATOR = /^(\d+[a-z]*|th|gc|aa|rl|fl|mjr|m|villa|classic|majors|sf|par|cla|vil|maj)$/i;
+  function developmentOf(name) {
+    const t = String(name == null ? "" : name).split(/\s+/).filter(Boolean);
+    while (t.length > 1 && DESIGNATOR.test(t[t.length - 1])) t.pop();
+    return t.join(" ").replace(/\d+$/, "").trim().toLowerCase();
+  }
+
+  /* Decide where a community is, from geocoded candidates for its streets.
+
+     candidates: [{ street, hit }] where hit is
+                 { lat, lon, precision, source, matchedStreet } or null/{error}
+     siblings:   already-located communities, for corroboration
+     Returns:
+       { status: "located",  lat, lon, confidence, evidence[] }
+       { status: "proposed", lat, lon, confidence, evidence[], why }
+       { status: "pending",  why, tried[] }                                     */
+  function resolveLocation(candidates, siblings, opts) {
+    const o = opts || {};
+    const agreeM = o.agreeM || AGREE_M;
+    const siblingM = o.siblingM || SIBLING_M;
+    const tried = [];
+    const good = [];
+
+    for (const c of candidates || []) {
+      const h = c.hit;
+      if (!h)             { tried.push({ street: c.street, result: "no result" }); continue; }
+      if (h.error)        { tried.push({ street: c.street, result: "geocoder error: " + h.error }); continue; }
+      if (!inBox(h))      { tried.push({ street: c.street, result: "outside the division" }); continue; }
+      if (!sameStreet(c.street, h.matchedStreet)) {
+        // The single most dangerous case, so it is named explicitly rather than
+        // lumped in with "no result".
+        tried.push({ street: c.street,
+                     result: 'matched a different street ("' + (h.matchedStreet || "?") + '") — rejected' });
+        continue;
+      }
+      tried.push({ street: c.street, result: "matched", lat: h.lat, lon: h.lon,
+                   precision: h.precision || null, source: h.source || null });
+      good.push({ street: c.street, lat: h.lat, lon: h.lon,
+                  precision: h.precision || null, source: h.source || null });
+    }
+
+    if (!good.length) {
+      if (!candidates || !candidates.length) {
+        return { status: "pending", tried,
+                 why: "no street names are available for this community yet" };
+      }
+      /* Say WHICH way it failed. "No result" means the street is too new to be in
+         the geocoder and will probably resolve on a later import. "Matched a
+         different street" means the geocoder offered a similar name somewhere
+         else and it was refused — a materially different situation, and the one
+         worth being loud about, because accepting it is how a pin ends up in the
+         wrong town. */
+      const rejected = tried.filter(t => /different street/.test(t.result));
+      const outside  = tried.filter(t => /outside the division/.test(t.result));
+      const parts = [];
+      if (rejected.length) {
+        parts.push(rejected.length + " street" + (rejected.length === 1 ? "" : "s")
+          + " matched a differently-named street and were refused rather than "
+          + "risk placing the pin somewhere else");
+      }
+      if (outside.length) {
+        parts.push(outside.length + " landed outside the division");
+      }
+      const rest = tried.length - rejected.length - outside.length;
+      if (rest > 0) {
+        parts.push(rest + " returned nothing — likely too new for the geocoder, "
+          + "which usually resolves on a later import");
+      }
+      return { status: "pending", tried, why: parts.join("; ") };
+    }
+
+    /* Corroboration by agreement: find the largest cluster of streets that land
+       within agreeM of each other. Two is enough — two independent street names
+       both resolving to the same patch of ground is not a coincidence. */
+    let best = null;
+    for (const anchor of good) {
+      const near = good.filter(g => {
+        const d = metresBetween(anchor, g);
+        return d != null && d <= agreeM;
+      });
+      if (!best || near.length > best.length) best = near;
+    }
+
+    const centre = ms => ({
+      lat: +(ms.reduce((a, g) => a + g.lat, 0) / ms.length).toFixed(7),
+      lon: +(ms.reduce((a, g) => a + g.lon, 0) / ms.length).toFixed(7)
+    });
+
+    if (best.length >= 2) {
+      const c = centre(best);
+      return { status: "located", lat: c.lat, lon: c.lon,
+               confidence: "agreement",
+               evidence: [best.length + " streets agree within "
+                          + (agreeM / 1000) + " km: " + best.map(g => g.street).join(", ")],
+               tried };
+    }
+
+    /* Only one street resolved. Look for an already-located sibling phase of the
+       same development to corroborate against. */
+    const only = good[0];
+    const devName = developmentOf(o.name || "");
+    const sibs = (siblings || []).filter(s =>
+      s && s.name && Number.isFinite(s.lat) && Number.isFinite(s.lon) &&
+      developmentOf(s.name) === devName && devName);
+
+    for (const s of sibs) {
+      const d = metresBetween(only, s);
+      if (d != null && d <= siblingM) {
+        return { status: "located", lat: only.lat, lon: only.lon,
+                 confidence: "sibling",
+                 evidence: ['one street ("' + only.street + '"), corroborated by '
+                            + s.name + " " + (d / 1000).toFixed(1) + " km away"],
+                 tried };
+      }
+    }
+
+    /* Has this exact proposal already been put to somebody and refused? Checked
+       here and nowhere else: the two corroborated paths above are different
+       evidence and are not suppressed by an earlier "no". */
+    const refused = wasRejected(o.rejected, only.street, only.lat, only.lon);
+    if (refused) {
+      return { status: "pending", tried,
+               why: '"' + only.street + '" resolved to the same point that was '
+                  + "rejected" + (refused.by ? " by " + refused.by : "")
+                  + (refused.at ? " on " + String(refused.at).slice(0, 10) : "")
+                  + ", so it is not being offered again — place it by hand, or "
+                  + "wait for a second street to be mapped" };
+    }
+
+    return {
+      status: "proposed", lat: only.lat, lon: only.lon,
+      confidence: "single",
+      street: only.street,
+      evidence: ['only "' + only.street + '" resolved'],
+      why: sibs.length
+        ? "the one street that resolved is more than " + (siblingM / 1000)
+          + " km from every located phase of " + (o.name || "this development")
+          + " — confirm before applying"
+        : "only one street resolved and there is no located sibling to check it "
+          + "against, so it could be a same-named street elsewhere — confirm before applying",
+      tried
+    };
+  }
+
+  /* Which communities still need locating, and what to try for each. Ordered by
+     how much is hidden with them, because that is what makes one worth chasing
+     before another. */
+  function pendingLocations(doc, streetsById) {
+    const out = [];
+    for (const c of (doc && doc.communities) || []) {
+      if (Number.isFinite(c.lat) && Number.isFinite(c.lon) && !(c.lat === 0 && c.lon === 0)) continue;
+      const streets = Object.entries((streetsById || {})[c.num] || {})
+        .sort((a, b) => b[1] - a[1])          // most lots first — the main road
+        .map(([street, lots]) => ({ street, lots }));
+      out.push({
+        num: c.num, name: c.name,
+        addr: c.addr || "",
+        streets,
+        startsHidden: (c.starts || []).reduce((a, b) => a + b, 0),
+        lastTried: (c.geo && c.geo.lastTried) || null,
+        previously: (c.geo && c.geo.tried) || null,
+        // Everything a reviewer needs in order to act, so the UI renders this
+        // list rather than re-reading the community records behind it.
+        proposed: (c.geo && c.geo.proposed) || null,
+        rejected: (c.geo && c.geo.rejected) || null,
+        why: (c.geo && c.geo.why) || null
+      });
+    }
+    return out.sort((a, b) => b.startsHidden - a.startsHidden);
+  }
+
+  /* Record an attempt on the community record so the next import knows what has
+     already been tried and the UI can show why something is still pending.
+     Deliberately stored on the document: it travels with the data, survives a
+     publish from either Blueprint or the CLI, and needs no extra table. */
+  function applyLocation(community, result, now) {
+    const c = community;
+    // Rejections outlive attempts. Rebuilding `geo` wholesale used to discard
+    // them, which handed a refused proposal straight back on the next import.
+    const kept = (c.geo && c.geo.rejected) || [];
+    c.geo = {
+      lastTried: new Date(now || Date.now()).toISOString(),
+      status: result.status,
+      tried: (result.tried || []).map(t => ({ street: t.street, result: t.result }))
+    };
+    if (kept.length) c.geo.rejected = kept;
+    if (result.status === "located") {
+      c.lat = result.lat;
+      c.lon = result.lon;
+      c.geoSource = result.confidence;      // "agreement" | "sibling" | "manual"
+      if (result.confidence !== "manual") c.approxGeo = true;
+      delete c.geo.status;                  // resolved; keep only the audit trail
+    } else if (result.status === "proposed") {
+      // The street travels with the proposal so that refusing it can record what
+      // was refused, not merely where.
+      c.geo.proposed = { lat: result.lat, lon: result.lon,
+                         street: result.street || null, why: result.why };
+    } else {
+      c.geo.why = result.why;
+    }
+    return c;
+  }
+
+  /* ── A PROPOSAL THAT WAS LOOKED AT AND REFUSED ────────────────────────────
+     A proposal is a question put to a person: "one street resolved, here is
+     where it lands, is that right?" Answering "no" has to be worth something,
+     or the next import asks again — and a question that is asked every week
+     stops being read, which is how the one genuinely wrong pin eventually gets
+     waved through.
+
+     So a rejection is written onto the community and consulted on the next run.
+     It is deliberately narrow: it suppresses THE SAME EVIDENCE, not the
+     community. The same street landing in the same place again is a question
+     already answered. A second street resolving, or a sibling phase appearing,
+     is new evidence and goes through on its own merits — keeping those two
+     paths separate is the whole point.
+
+     250 m, because a geocoder asked for the same street twice does not return
+     quite the same point — a block centroid one week, an interpolated address
+     range the next. Wide enough to recognise the same answer, far too tight to
+     swallow a different one. */
+  const REJECT_M = 250;
+
+  function wasRejected(rejections, street, lat, lon) {
+    for (const r of rejections || []) {
+      if (streetKey(r.street) !== streetKey(street)) continue;
+      const d = metresBetween({ lat: r.lat, lon: r.lon }, { lat: lat, lon: lon });
+      /* A rejection recorded without a coordinate suppresses that street
+         outright. Erring towards not re-asking is the safe direction: the cost
+         is one question not repeated, and the manual path is always open. */
+      if (d == null || d <= REJECT_M) return r;
+    }
+    return null;
+  }
+
+  /* ── WRITING A LOCATION ONTO A COMMUNITY ──────────────────────────────────
+     Four ways a coordinate can arrive, and they are not equally trustworthy:
+
+       agreement  two of the community's own streets landed together
+       sibling    one street, vouched for by a located phase of the same development
+       confirmed  one street, and a person looked at it and said yes
+       manual     a person typed the coordinate
+
+     `geoSource` records which, so a year from now a pin can be read for how
+     much it is worth. Everything except `manual` is flagged `approxGeo`, which
+     is what stops validate.js quietly moving it later — a geocode is evidence,
+     not a survey. A typed coordinate is left alone entirely, because a person
+     with a map in front of them beats every heuristic in this file. */
+
+  /* The audit trail has to survive all of these writes. An earlier version
+     rebuilt `geo` from scratch on each attempt, which threw the rejections away
+     — so a refused proposal came straight back on the next import, which is
+     precisely what the rejection exists to prevent. */
+  function geoOf(c) {
+    const g = c.geo || {};
+    return { tried: g.tried || [], rejected: g.rejected || [] };
+  }
+
+  function stamp(now) { return new Date(now || Date.now()).toISOString(); }
+
+  /* Accept a proposal already recorded on the community. Returns { ok } or
+     { ok:false, error } rather than throwing: every caller is a UI that has to
+     say what went wrong, and none of them can do anything with an exception. */
+  function acceptProposal(community, opts) {
+    const o = opts || {};
+    const c = community;
+    const p = c.geo && c.geo.proposed;
+    if (!p) return { ok: false, error: "there is no proposal on this community to accept" };
+    if (!inBox(p)) return { ok: false, error: "the proposed point is outside the division" };
+
+    const prev = geoOf(c);
+    c.lat = p.lat; c.lon = p.lon;
+    c.geoSource = "confirmed";
+    c.approxGeo = true;
+    c.geo = {
+      lastTried: stamp(o.now),
+      confirmedAt: stamp(o.now),
+      confirmedBy: o.by || null,
+      tried: prev.tried
+    };
+    if (prev.rejected.length) c.geo.rejected = prev.rejected;
+    return { ok: true, lat: c.lat, lon: c.lon };
+  }
+
+  /* Refuse one. The coordinate is kept, because it is the evidence — without it
+     the record cannot tell "this street, here" from "this street, anywhere". */
+  function rejectProposal(community, opts) {
+    const o = opts || {};
+    const c = community;
+    const p = c.geo && c.geo.proposed;
+    if (!p) return { ok: false, error: "there is no proposal on this community to reject" };
+
+    const prev = geoOf(c);
+    const street = p.street
+      || (prev.tried.filter(t => t.result === "matched")[0] || {}).street
+      || null;
+
+    prev.rejected.push({
+      street: street, lat: p.lat, lon: p.lon,
+      at: stamp(o.now), by: o.by || null,
+      reason: o.reason || null
+    });
+
+    c.geo = {
+      lastTried: stamp(o.now),
+      tried: prev.tried,
+      rejected: prev.rejected,
+      why: "a proposal at this point was rejected" + (o.by ? " by " + o.by : "")
+         + " — it will not be offered again on the same evidence"
+    };
+    return { ok: true, rejected: prev.rejected[prev.rejected.length - 1] };
+  }
+
+  /* A coordinate typed by a person. Validated the same way an automatic one is:
+     the division bounding box catches a transposed pair, which is the mistake
+     people actually make. "-81.5, 28.6" puts Orlando in the Indian Ocean and
+     reads perfectly plausibly right up until the map draws. */
+  function placeManually(community, lat, lon, opts) {
+    const o = opts || {};
+    const c = community;
+    const la = Number(lat), lo = Number(lon);
+    if (!Number.isFinite(la) || !Number.isFinite(lo)) {
+      return { ok: false, error: "that is not a pair of numbers" };
+    }
+    if (la === 0 && lo === 0) {
+      return { ok: false, error: "0,0 is null island, not a location" };
+    }
+    if (!inBox({ lat: la, lon: lo })) {
+      return { ok: false, error: la + "," + lo + " is outside the division — latitude "
+        + "should be about " + BBOX.minLat + " to " + BBOX.maxLat + " and longitude about "
+        + BBOX.minLon + " to " + BBOX.maxLon
+        + (inBox({ lat: lo, lon: la }) ? ". Those two look swapped." : "") };
+    }
+
+    const prev = geoOf(c);
+    c.lat = +la.toFixed(7);
+    c.lon = +lo.toFixed(7);
+    c.geoSource = "manual";
+    // A typed coordinate is not approximate, and marking it so would invite a
+    // later --fix run to move it.
+    delete c.approxGeo;
+    c.geo = {
+      lastTried: stamp(o.now),
+      placedAt: stamp(o.now),
+      placedBy: o.by || null,
+      tried: prev.tried
+    };
+    if (prev.rejected.length) c.geo.rejected = prev.rejected;
+    if (o.note) c.geo.note = o.note;
+    return { ok: true, lat: c.lat, lon: c.lon };
+  }
+
+  /* "28.6607, -81.5458" as a person pastes it — out of Google Maps, out of an
+     email, off a phone. Accepts a comma or whitespace between the two, a degree
+     sign, and a trailing hemisphere letter. W and S negate, which is the one
+     transformation worth making: a coordinate copied from a site that writes
+     "81.5458° W" is otherwise silently in China.
+
+     Anything else returns null rather than a guess. */
+  function parseLatLon(text) {
+    const s = String(text == null ? "" : text).trim();
+    if (!s) return null;
+    const m = s.match(
+      /^\s*(-?\d+(?:\.\d+)?)\s*°?\s*([NnSs])?\s*(?:,\s*|\s+)(-?\d+(?:\.\d+)?)\s*°?\s*([EeWw])?\s*$/);
+    if (!m) return null;
+    let lat = parseFloat(m[1]), lon = parseFloat(m[3]);
+    if (m[2] && /[Ss]/.test(m[2])) lat = -Math.abs(lat);
+    if (m[4] && /[Ww]/.test(m[4])) lon = -Math.abs(lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    return { lat: lat, lon: lon };
+  }
+
   /* ============================== PARSERS ==================================
      Each takes rows already extracted from a workbook — never a workbook — so
      this file never touches SheetJS and the caller decides how sheets are read.
@@ -157,9 +712,17 @@
      ======================================================================== */
 
   /* Starts. Two layouts are seen in the wild; both are handled, matching
-     buildDivision() in the Vendor Assignments app. */
+     buildDivision() in the Vendor Assignments app.
+
+     Also collects the street names, which is how a new community gets located.
+     Every row of the permit log carries an Address; for an established community
+     it is a real one ("1660 Rider Rain Ln"), and for a brand-new one the house
+     number has not been assigned yet so it reads "TBD Sunfish Drive". Either way
+     the STREET is there, and the streets of a subdivision are enough to place it
+     — see resolveLocation(). */
   function parseStarts(rows, sheetName, find) {
     const records = [], idName = {};
+    const streets = {};        // community id -> { STREET: lotCount }
     let skipped = 0;
 
     for (const r of rows) {
@@ -176,10 +739,21 @@
         date = xlDate(a || p); kind = a ? "Actual" : "Projected"; job = r["Job"];
       }
 
+      /* Streets are gathered from every row, before the date filter below. A lot
+         with no start date still tells you where the subdivision is, and the
+         newest communities are exactly the ones most likely to lack dates. */
+      const id0 = normCommunityId(job);
+      if (id0) {
+        const st = streetOf(r["Address"]);
+        if (st) {
+          streets[id0] = streets[id0] || {};
+          streets[id0][st] = (streets[id0][st] || 0) + 1;
+        }
+      }
+
       if (!community || !date) { skipped++; continue; }
-      const id = normCommunityId(job);
-      if (id) idName[id] = community;
-      records.push({ id, community, date, kind });
+      if (id0) idName[id0] = community;
+      records.push({ id: id0, community, date, kind });
     }
 
     find.notes.push(`starts: sheet "${sheetName}", ${rows.length} rows → ${records.length} start records`
@@ -187,7 +761,7 @@
     if (!records.length) {
       find.problems.push("the starts workbook produced no usable rows — wrong file, or the columns have been renamed");
     }
-    return { records, idName };
+    return { records, idName, streets };
   }
 
   function aggregateStarts(records, dataStart, find) {
@@ -663,6 +1237,10 @@
     S, digits, normCommunityId, xlDate, cleanCommName, normName, personIdFor,
     COMMUNITY_ALIASES, COMMUNITY_SPLIT, IGNORED_DEVELOPMENTS, AWAITING_CONTACTS,
     PLACEHOLDER_PER_DAY, GROWTH_REFUSE,
+    STREET_TYPES, DIRECTIONS, BBOX, AGREE_M, SIBLING_M, REJECT_M,
+    streetOf, streetKey, sameStreet, metresBetween, inBox, developmentOf,
+    resolveLocation, pendingLocations, applyLocation,
+    acceptProposal, rejectProposal, placeManually, parseLatLon, wasRejected,
     parseStarts, aggregateStarts, parseRE2, parseContacts,
     currentDataStart, buildDocument, diffDocument
   };

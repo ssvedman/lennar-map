@@ -205,6 +205,17 @@ async function boot(opts = {}) {
 (async () => {
   console.log('\nindex.html (jsdom, Leaflet stubbed)\n');
 
+  /* The fixture's own baseline. Everything about unlocated communities is
+     asserted relative to this, because the real data.json is a live document. */
+  const BASE = (() => {
+    const raw = JSON.parse(fs.readFileSync(path.join(ROOT, 'data.json'), 'utf8'));
+    const placeable = c => Number.isFinite(c.lat) && Number.isFinite(c.lon)
+                        && !(c.lat === 0 && c.lon === 0);
+    const un = raw.communities.filter(c => !placeable(c));
+    return { total: raw.communities.length, plotted: raw.communities.length - un.length,
+             unlocated: un.length };
+  })();
+
   const win = await boot();
   const doc = win.document;
   const $ = s => doc.querySelector(s);
@@ -240,8 +251,19 @@ async function boot(opts = {}) {
   });
 
   await test('header counts come from the data, not the markup', () => {
-    eq($('#hdr-count').textContent, '71', 'header community count');
-    eq($('#hdr-starts').textContent, '2,230', 'header total starts');
+    /* Derived from the fixture rather than hardcoded. These numbers change every
+       time a weekly import runs, and a suite that fails on a legitimate data
+       change is a suite people learn to ignore. What is worth asserting is that
+       the header agrees with the data — not what the data happens to say today. */
+    const raw = JSON.parse(fs.readFileSync(path.join(ROOT, 'data.json'), 'utf8'));
+    const placeable = c => Number.isFinite(c.lat) && Number.isFinite(c.lon)
+                        && !(c.lat === 0 && c.lon === 0);
+    const plotted = raw.communities.filter(placeable);
+    const starts = plotted.reduce((a, c) => a + c.starts.reduce((x, y) => x + y, 0), 0);
+    eq($('#hdr-count').textContent, String(plotted.length),
+       'header community count matches the plottable communities');
+    eq($('#hdr-starts').textContent, starts.toLocaleString(),
+       'header total starts matches their starts');
     assert(/–/.test($('#hdr-window').textContent), 'window label should be a range');
   });
 
@@ -305,12 +327,30 @@ async function boot(opts = {}) {
     assert(singles.includes('Villa Mar 40'), 'Villa Mar should stand alone');
   });
 
-  await test('the two exact-duplicate coordinate pairs are merged', () => {
+  await test('communities at identical coordinates are merged onto one pin', () => {
+    /* Finds the duplicate pairs in the data instead of naming them. The pair this
+       test used to name was "Crossprairie 25 TH", which a later import renamed to
+       "Crossprairie 25GC" — the permit log is the authority on names and the
+       importer applies it. A test that hardcodes a name asserts the state of one
+       import rather than the behaviour of the code. */
     const nameOf = i => S().communities[i].name;
     const groupNames = S().groups.map(g => g.members.map(nameOf));
     const together = (a, b) => groupNames.some(g => g.includes(a) && g.includes(b));
-    assert(together('Crossprairie 25', 'Crossprairie 25 TH'), 'Crossprairie pair not merged');
-    assert(together('Ranches 40GC', 'Ranches 60GC'), 'Ranches pair not merged');
+
+    const byPoint = new Map();
+    S().communities.forEach(c => {
+      const k = c.lat + ',' + c.lon;
+      if (!byPoint.has(k)) byPoint.set(k, []);
+      byPoint.get(k).push(c.name);
+    });
+    const dupes = [...byPoint.values()].filter(v => v.length > 1);
+    assert(dupes.length > 0, 'the fixture should contain at least one co-located pair');
+    for (const names of dupes) {
+      for (let i = 1; i < names.length; i++) {
+        assert(together(names[0], names[i]),
+          `"${names[0]}" and "${names[i]}" share a coordinate but not a pin`);
+      }
+    }
   });
 
   await test('a merged pin carries a count badge, a single pin does not', () => {
@@ -624,9 +664,14 @@ async function boot(opts = {}) {
         { name: 'Nowhere Ranch', lat: null, lon: null });
     } });
     const st = S(w);
-    eq(st.communities.length, 70, 'the unplaceable community should be excluded');
-    eq(st.unlocated.length, 1, 'and counted as unlocated');
-    eq(st.unlocated[0].name, 'Nowhere Ranch', 'the right record should be held back');
+    /* Relative to the fixture's own baseline. The real data.json legitimately
+       carries unlocated communities — three, at the time of writing — because
+       that is the state a new community arrives in. Asserting an absolute count
+       would break on every import that adds one. */
+    eq(st.communities.length, BASE.plotted - 1, 'the unplaceable community should be excluded');
+    eq(st.unlocated.length, BASE.unlocated + 1, 'and counted as unlocated');
+    assert(st.unlocated.some(c => c.name === 'Nowhere Ranch'),
+           'the right record should be held back');
     assert(!st.communities.some(c => c.name === 'Nowhere Ranch'),
            'it must not appear among the plotted communities');
     // The real bug this prevents: a null in the centroid average.
@@ -639,8 +684,10 @@ async function boot(opts = {}) {
       row.payload.communities[0] = Object.assign({}, row.payload.communities[0],
         { name: 'Null Island', lat: 0, lon: 0 });
     } });
-    eq(S(w).unlocated.length, 1, '0,0 should be rejected — it is what a null becomes');
-    eq(S(w).unlocated[0].name, 'Null Island', 'the right record should be held back');
+    eq(S(w).unlocated.length, BASE.unlocated + 1,
+       '0,0 should be rejected — it is what a null becomes');
+    assert(S(w).unlocated.some(c => c.name === 'Null Island'),
+           'the right record should be held back');
   });
 
   await test('unlocated communities are disclosed in the header, by name', async () => {
@@ -650,7 +697,9 @@ async function boot(opts = {}) {
     } });
     const html = w.document.getElementById('update-info').innerHTML;
     assert(/awaiting a location/.test(html), 'the header should flag the omission');
-    assert(/1 community awaiting/.test(html), `singular wording expected, got: ${html}`);
+    const n = BASE.unlocated + 1;
+    assert(new RegExp(n + ' communit' + (n === 1 ? 'y' : 'ies') + ' awaiting').test(html),
+           `expected "${n} communit${n === 1 ? 'y' : 'ies'} awaiting", got: ${html}`);
     assert(/Nowhere Ranch/.test(html), 'the tooltip should name which community');
   });
 

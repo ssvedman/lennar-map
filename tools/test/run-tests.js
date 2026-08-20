@@ -106,6 +106,63 @@ test('null island is an error', () => {
   assert(/null island/.test(r.out), r.out);
 });
 
+/* ── an absent coordinate is a normal state, not an error ─────────────────────
+   A new community arrives with no coordinate, and the map holds it off the map
+   rather than plotting it at 0,0. Treating that as an error made this script exit
+   1 after every import, which is how a report stops being read. */
+
+test('a community with no coordinate is reported, not failed', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].lat = null; d.communities[0].lon = null; d.communities[0].addr = '';
+  d.communities[0].starts = [7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const r = run(fx);
+  assert(r.code === 0, `an unlocated community must not fail the run:\n${r.out}`);
+  assert(/awaiting a location/.test(r.out), `should be reported:\n${r.out}`);
+  assert(/7 starts hidden/.test(r.out),
+    `and the starts it hides are what say whether it matters:\n${r.out}`);
+  assert(!/missing required field "lat"/.test(r.out),
+    'and it is not reported three times over as a missing field');
+  assert(!/lat\/lon is not numeric/.test(r.out), 'nor as a type error');
+});
+
+test('but a coordinate that is present and wrong is still an error', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  // A string where a number belongs is a bug, unlike an honest absence.
+  d.communities[0].lat = '28.5'; d.communities[0].lon = '-81.5';
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const r = run(fx);
+  assert(r.code === 1, 'expected exit 1');
+  assert(/present but not numeric/.test(r.out), r.out);
+});
+
+test('two communities with no coordinates do not "share a map pin"', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  // Both unlocated. Comparing null to null found them 0 m apart and reported a
+  // shared pin — neither is on the map, so they share nothing.
+  for (const i of [0, 1]) {
+    if (!d.communities[i]) continue;
+    d.communities[i].lat = null; d.communities[i].lon = null; d.communities[i].addr = '';
+  }
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const r = run(fx);
+  assert(!/share one map pin/.test(r.out), `false co-location warning:\n${r.out}`);
+});
+
+test('a community with no address says so once, not once per geocoder', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].lat = null; d.communities[0].lon = null; d.communities[0].addr = '';
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const r = run(fx, ['--geocode']);
+  assert(/no address yet/.test(r.out), `should explain the real problem:\n${r.out}`);
+  assert(!/geocoder unavailable/.test(r.out),
+    'and must not blame the geocoder for being handed an empty string');
+});
+
 test('a dataStart that misplaces the current month is an error', () => {
   const fx = tmpFixture({ dataStart: '2019-01' });
   const r = run(fx);
@@ -231,6 +288,101 @@ test('the chain falls through to Nominatim when Census is down', () => {
   const fx = tmpFixture();
   const r = run(fx, ['--fix'], { GEOCODE_CASE: 'census-down' });
   assert(/corrected 1 coordinate/.test(r.out), `expected fallback to succeed:\n${r.out}`);
+});
+
+/* ── A COORDINATE SOMEBODY TYPED IS NOT THIS TOOL'S TO REVISE ────────────────
+   `approxGeo` marks a coordinate this tooling produced and may therefore revise.
+   A hand-placed one carries geoSource "manual" and deliberately no approxGeo
+   flag — a person with a plat beats every heuristic here. Reading the absent
+   flag as permission to move it would have --fix quietly undoing the one
+   correction somebody went to the trouble of making, which is the worst possible
+   direction for a tool that runs unattended. */
+
+test('--fix never moves a hand-placed coordinate', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].geoSource = 'manual';
+  delete d.communities[0].approxGeo;
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const before = coordsOf(fx);
+
+  const r = run(fx, ['--fix'], { GEOCODE_CASE: 'confident-drift' });
+  const after = coordsOf(fx);
+  assert(after[0] === before[0] && after[1] === before[1],
+    `a manual coordinate must not move, went ${before} → ${after}`);
+  assert(!/corrected 1 coordinate/.test(r.out), `and must not be reported as corrected:\n${r.out}`);
+  // Still reported, though: a hand-placed pin 8 km from its own address is worth
+  // knowing about. Silence would be the other way of getting this wrong.
+  assert(/placed by hand, so it is reported but never moved/.test(r.out),
+    `it should still be surfaced:\n${r.out}`);
+});
+
+/* ── PLACING is not CORRECTING ────────────────────────────────────────────────
+   metres() reads an absent latitude as 0, so the distance from a null coordinate
+   to a perfectly correct geocode was ~9,162 km against a 2 km ceiling. --fix
+   therefore refused to place ANY new community, including one whose address a
+   human had typed in — while its own output told you to run it for exactly that. */
+
+test('--fix places a community that has an address but no coordinate', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].lat = null; d.communities[0].lon = null;
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+
+  const r = run(fx, ['--fix'], { GEOCODE_CASE: 'confident-drift' });
+  assert(r.code === 0, `expected success:\n${r.out}`);
+  assert(/placed 1 community/.test(r.out), `should report a placement:\n${r.out}`);
+
+  const after = JSON.parse(fs.readFileSync(fx.dp)).communities[0];
+  assert(typeof after.lat === 'number' && typeof after.lon === 'number',
+    `the coordinate must actually be written, got ${after.lat},${after.lon}`);
+  assert(after.approxGeo === true,
+    'and flagged approximate, so a later run will not silently move it');
+});
+
+test('a placement is reported separately from a correction', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].lat = null; d.communities[0].lon = null;
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const r = run(fx, ['--fix'], { GEOCODE_CASE: 'confident-drift' });
+  // "placed" and "corrected" are different events and must not read alike.
+  assert(/placed/.test(r.out), 'says placed');
+  assert(!/moved .* km/.test(r.out),
+    `a first placement has not "moved" anything:\n${r.out}`);
+});
+
+test('--geocode without --fix reports the placement but writes nothing', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].lat = null; d.communities[0].lon = null;
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const r = run(fx, ['--geocode'], { GEOCODE_CASE: 'confident-drift' });
+  assert(/re-run with --fix to place it/.test(r.out), `should offer it:\n${r.out}`);
+  const after = JSON.parse(fs.readFileSync(fx.dp)).communities[0];
+  assert(after.lat === null, 'and must not have written the coordinate');
+});
+
+test('a coarse match is refused for placement, not just for correction', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].lat = null; d.communities[0].lon = null;
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  // A town centroid is not a homesite. Placing a pin on one is worse than none.
+  const r = run(fx, ['--fix'], { GEOCODE_CASE: 'coarse-only' });
+  assert(/too coarse to place a pin/.test(r.out), `should refuse:\n${r.out}`);
+  const after = JSON.parse(fs.readFileSync(fx.dp)).communities[0];
+  assert(after.lat === null, 'and leave the coordinate absent');
+});
+
+test('a geocode outside the division is refused for placement too', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].lat = null; d.communities[0].lon = null;
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const r = run(fx, ['--fix'], { GEOCODE_CASE: 'out-of-box' });
+  const after = JSON.parse(fs.readFileSync(fx.dp)).communities[0];
+  assert(after.lat === null, `a Chicago geocode must not place an Orlando community:\n${r.out}`);
 });
 
 test('an approximate location is never auto-corrected', () => {

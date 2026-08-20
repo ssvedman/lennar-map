@@ -126,7 +126,7 @@ function metres(a, b) {
 
 /* ── reporting ────────────────────────────────────────────────────────────── */
 
-const errors = [], warnings = [], fixes = [];
+const errors = [], warnings = [], fixes = [], placements = [];
 const err = (who, msg) => errors.push({ who, msg });
 const warn = (who, msg) => warnings.push({ who, msg });
 
@@ -167,6 +167,8 @@ function checkSchema(data, people) {
     const who = c.name || c.num || '(unnamed)';
 
     for (const k of REQUIRED) {
+      // lat/lon are handled below: absent is expected, wrong is not.
+      if (k === 'lat' || k === 'lon') continue;
       if (c[k] == null) err(who, `missing required field "${k}"`);
     }
     if (!Array.isArray(c.starts) || c.starts.length !== 12) {
@@ -178,10 +180,23 @@ function checkSchema(data, people) {
     if (seenNum.has(c.num)) err(who, `duplicate community number ${c.num} (also ${seenNum.get(c.num)})`);
     else seenNum.set(c.num, who);
 
-    if (typeof c.lat !== 'number' || typeof c.lon !== 'number') {
-      err(who, 'lat/lon is not numeric');
+    /* An ABSENT coordinate is not an error. It is the state every new community
+       arrives in, and the map now holds such communities off the map and reports
+       the count rather than plotting them at 0,0. Treating it as an error meant
+       this script exited 1 on every run that followed an import, which is how a
+       report stops being read.
+
+       A PRESENT but nonsensical coordinate is still an error: 0,0 is what a null
+       becomes after arithmetic, and outside the division means something wrote a
+       wrong value. Those are bugs; a new community is not. */
+    const absent = c.lat == null && c.lon == null;
+    if (absent) {
+      // Counted at report time, not here: --fix may place some of these a few
+      // lines further down, and a note written before that runs is already wrong.
+    } else if (typeof c.lat !== 'number' || typeof c.lon !== 'number') {
+      err(who, `lat/lon is present but not numeric (${JSON.stringify(c.lat)},${JSON.stringify(c.lon)})`);
     } else if (c.lat === 0 && c.lon === 0) {
-      err(who, 'coordinates are 0,0 — null island');
+      err(who, 'coordinates are 0,0 — null island, which is what a null becomes after arithmetic');
     } else if (c.lat < BBOX.minLat || c.lat > BBOX.maxLat || c.lon < BBOX.minLon || c.lon > BBOX.maxLon) {
       err(who, `coordinates ${c.lat},${c.lon} fall outside the division bounding box`);
     }
@@ -218,7 +233,16 @@ function checkSchema(data, people) {
 }
 
 function checkColocation(data) {
-  const cs = data.communities || [];
+  /* Only communities that are actually on the map can share a pin.
+
+     Without the guard this compared null to null, found them 0 m apart, and
+     reported that two communities with no coordinates "share one map pin" —
+     neither is on the map, so they share nothing. Three new communities produced
+     three such warnings, crying wolf in the one report that is supposed to be
+     worth reading. */
+  const cs = (data.communities || []).filter(c =>
+    Number.isFinite(c.lat) && Number.isFinite(c.lon));
+
   for (let i = 0; i < cs.length; i++) {
     for (let j = i + 1; j < cs.length; j++) {
       const d = metres(cs[i], cs[j]);
@@ -236,26 +260,78 @@ async function checkGeocode(data) {
   process.stderr.write(`geocoding ${cs.length} addresses via ${CHAIN.join(' → ')}\n`);
 
   for (const c of cs) {
+    /* No address, nothing to ask. Census answers a blank query with HTTP 400,
+       which produced one "geocoder unavailable" warning per new community —
+       noise that hid the real message, which is simply that the address is not
+       known yet. Say that instead, once. */
+    if (!String(c.addr || '').trim()) {
+      warn(c.name, c.lat == null
+        ? 'no address yet, so there is nothing to geocode — set one, or let '
+          + 'Blueprint locate it from the permit log streets'
+        : 'no address recorded (the coordinate is set, so this is cosmetic)');
+      continue;
+    }
     const query = `${c.addr}`;
     const hit = await geocode(query);
 
     if (!hit) { warn(c.name, 'no geocoder returned a result'); continue; }
     if (hit.error) { warn(c.name, `geocoder unavailable (${hit.error})`); continue; }
 
-    const d = metres(c, hit);
     const inBox = hit.lat >= BBOX.minLat && hit.lat <= BBOX.maxLat
                && hit.lon >= BBOX.minLon && hit.lon <= BBOX.maxLon;
-
     if (!inBox) { warn(c.name, `geocode landed outside the division — ignored`); continue; }
+
+    /* PLACING a community is a different operation from CORRECTING one, and
+       conflating them meant --fix could never place anything.
+
+       metres() reads an absent latitude as 0, so the distance from a null
+       coordinate to a perfectly correct geocode is about 9,162 km — four
+       thousand times the 2 km ceiling that exists to stop a bad geocode moving a
+       good pin. The guard was doing its job; it was just being asked the wrong
+       question. There is no drift to measure when there is no prior position.
+
+       So: no coordinate, plus an address-precision result inside the division,
+       is a placement. It is flagged approxGeo, because a single geocode of a
+       hand-typed address is weaker evidence than the corroborated agreement
+       map-core requires, and approxGeo means no later run will silently move it. */
+    if (c.lat == null && c.lon == null) {
+      if (hit.precision !== 'address') {
+        warn(c.name, `has no coordinate, and the geocoder only managed `
+          + `${hit.precision} precision (${hit.source}) — too coarse to place a pin`);
+        continue;
+      }
+      if (FIX) {
+        c.lat = +hit.lat.toFixed(7);
+        c.lon = +hit.lon.toFixed(7);
+        c.approxGeo = true;
+        placements.push({ who: c.name, to: [c.lat, c.lon], source: hit.source, addr: c.addr });
+      } else {
+        warn(c.name, `has no coordinate; "${c.addr}" resolves to `
+          + `${hit.lat.toFixed(5)},${hit.lon.toFixed(5)} (${hit.source}) — re-run with --fix to place it`);
+      }
+      continue;
+    }
+
+    const d = metres(c, hit);
     if (d <= DRIFT_OK_M) continue; // agrees, nothing to say
 
     const detail = `stored point is ${(d / 1000).toFixed(2)} km from the geocoded address `
                  + `(${hit.source}, ${hit.precision})`;
 
-    // Only an address-precision result inside the sane-drift band is allowed to
-    // rewrite a coordinate. A street or area match at 5 km is the geocoder
-    // failing to find a new subdivision, not evidence the pin is wrong.
-    const confident = hit.precision === 'address' && d <= DRIFT_FIX_MAX_M && !c.approxGeo;
+    /* Only an address-precision result inside the sane-drift band is allowed to
+       rewrite a coordinate. A street or area match at 5 km is the geocoder
+       failing to find a new subdivision, not evidence the pin is wrong.
+
+       And nothing rewrites a HAND-PLACED one. `approxGeo` marks a coordinate
+       this tooling produced and may therefore revise; a coordinate somebody
+       typed carries geoSource "manual" and no approxGeo flag, and treating the
+       absent flag as permission to move it would have this tool quietly undoing
+       the one correction a person went to the trouble of making. It is still
+       reported, because a manual pin 8 km from its own address is worth
+       knowing about — it is just not overwritten. */
+    const byHand = c.geoSource === 'manual';
+    const confident = hit.precision === 'address' && d <= DRIFT_FIX_MAX_M
+                   && !c.approxGeo && !byHand;
 
     if (FIX && confident) {
       fixes.push({ who: c.name, from: [c.lat, c.lon], to: [hit.lat, hit.lon], d });
@@ -264,6 +340,8 @@ async function checkGeocode(data) {
       delete c.approxGeo;
     } else if (confident) {
       warn(c.name, `${detail} — re-run with --fix to correct`);
+    } else if (byHand) {
+      warn(c.name, `${detail} — placed by hand, so it is reported but never moved`);
     } else {
       warn(c.name, `${detail} — needs a human`);
     }
@@ -293,14 +371,51 @@ async function checkGeocode(data) {
     await checkGeocode(data);
   }
 
-  if (fixes.length) {
+  if (placements.length || fixes.length) {
     fs.writeFileSync(DATA, JSON.stringify(data));
+  }
+
+  if (placements.length) {
+    // Placing a pin that did not exist is a bigger event than nudging one, so it
+    // is reported first and separately.
+    console.log(`\n  placed ${placements.length} communit${placements.length === 1 ? 'y' : 'ies'} `
+      + `that had no coordinate:`);
+    for (const p of placements) {
+      console.log(`    + ${p.who.padEnd(22)} ${p.to[0]},${p.to[1]}  (${p.source})`);
+      console.log(`      from "${p.addr}"`);
+    }
+    console.log('      Flagged approximate, so no later run will move them silently.');
+  }
+
+  if (fixes.length) {
     // Corrections are written but still printed. A coordinate moving is
     // something a reviewer should see in the run output, not only in the diff.
     console.log(`\n  corrected ${fixes.length} coordinate${fixes.length === 1 ? '' : 's'}:`);
     for (const f of fixes) {
       console.log(`    ✓ ${f.who.padEnd(22)} moved ${(f.d / 1000).toFixed(2)} km  `
         + `${f.from[0]},${f.from[1]} → ${f.to[0]},${f.to[1]}`);
+    }
+  }
+
+  /* Communities still without a coordinate. Reported as a note rather than an
+     error: this is the expected state of a new community, and the starts figure
+     is what says whether it matters. Three communities is housekeeping; a
+     hundred hidden starts is not. */
+  /* Derived from the document as it now stands, AFTER any placements above. An
+     earlier version collected this during the schema check and then reported
+     three communities awaiting a location on a run that had just placed one of
+     them. */
+  const unlocated = (data.communities || [])
+    .filter(c => c.lat == null && c.lon == null)
+    .map(c => ({ who: c.name || c.num, starts: (c.starts || []).reduce((a, b) => a + b, 0) }));
+
+  if (unlocated.length) {
+    const hidden = unlocated.reduce((a, u) => a + u.starts, 0);
+    console.log(`\n  ${unlocated.length} communit${unlocated.length === 1 ? 'y' : 'ies'} `
+      + `still awaiting a location`
+      + (hidden ? `, hiding ${hidden} start${hidden === 1 ? '' : 's'} from the map:` : ':'));
+    for (const u of unlocated.sort((a, b) => b.starts - a.starts)) {
+      console.log(`    · ${u.who.padEnd(22)}${u.starts} start${u.starts === 1 ? '' : 's'} hidden`);
     }
   }
 
