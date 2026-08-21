@@ -7,14 +7,18 @@
    the files — which is harmless, but it also means you would not notice that the
    database side was never populated.
 
-     node tools/seed-supabase.js --key <SERVICE_ROLE_KEY>
-     node tools/seed-supabase.js --key <KEY> --dry-run
-     node tools/seed-supabase.js --key <KEY> --url https://xxxx.supabase.co --row orlando
+     SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js
+     SUPABASE_KEY=<KEY> node tools/seed-supabase.js --dry-run
+     SUPABASE_KEY=<KEY> node tools/seed-supabase.js --url https://xxxx.supabase.co --row orlando
+
+   In PowerShell, set it first: $env:SUPABASE_KEY = '<KEY>'
 
    The anon key cannot write (RLS restricts insert/update to admin/editor in
    app_roles, and anon has no JWT), so use the service role key from
-   Supabase Studio > Settings > API. Do not commit it — pass it on the command
-   line or via SUPABASE_KEY in the environment.
+   Supabase Studio > Settings > API. Do not commit it, and prefer SUPABASE_KEY
+   in the environment: --key still works, but a key spelled out on the command
+   line is kept in your shell history and is visible in the process list to
+   anyone else on the machine.
 
    Deliberately dependency-free: global fetch (Node 18+) and fs, matching the
    other tools in this directory.
@@ -50,7 +54,8 @@ if (typeof fetch !== 'function') {
   process.exit(2);
 }
 if (!DRY && !KEY) {
-  console.error('Missing --key. Pass the service role key, or --dry-run to check the payload only.');
+  console.error('Missing key. Set SUPABASE_KEY in the environment to the service role key (--key\n'
+    + 'also works, but leaves the key in your shell history), or --dry-run to check the payload only.');
   process.exit(2);
 }
 

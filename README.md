@@ -69,12 +69,16 @@ node tools/import-workbooks.js --re2 RE2.xlsx --starts StartSchedule.xlsx \
                                --contacts "Construction Community Contact.xlsx"
 node tools/locate-communities.js --starts StartSchedule.xlsx   # place new communities
 node tools/validate.js --fix          # geocode drift check
-node tools/seed-supabase.js --key <SERVICE_ROLE_KEY>
+SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js   # PowerShell: $env:SUPABASE_KEY = '<KEY>'
 ```
 
 The importer and validator write `data.json`/`people.json` exactly as they always have;
 `seed-supabase.js` pushes those files into `map_data`. Commit the files too, so the
 fallback copy does not drift from what is published.
+
+Pass the service role key through the environment as above. `--key <SERVICE_ROLE_KEY>` is
+still accepted, but it writes the key into your shell history and shows it to anyone who
+can list processes on the machine.
 
 ## Communities with no coordinates
 

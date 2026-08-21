@@ -15,7 +15,7 @@
  *
  * Any source can be passed alone; the others are left untouched.
  * Follow with: node tools/validate.js --fix
- * Then:        node tools/seed-supabase.js --key <SERVICE_ROLE_KEY>
+ * Then:        SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js
  *
  * MERGE, NOT REBUILD. The workbooks carry starts, trade assignments and
  * contacts. Coordinates, municipality, utilities and plans exist only in
@@ -171,7 +171,7 @@ function main() {
   fs.writeFileSync(PEOPLE, JSON.stringify(result.people));
   console.log(`\n  wrote ${path.relative(process.cwd(), DATA)}`);
   console.log('  next:  node tools/validate.js --fix');
-  console.log('  then:  node tools/seed-supabase.js --key <SERVICE_ROLE_KEY>\n');
+  console.log('  then:  SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js\n');
 }
 
 /* ── report ───────────────────────────────────────────────────────────────── */

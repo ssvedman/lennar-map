@@ -96,7 +96,7 @@ if (PLACE) {
   } else {
     fs.writeFileSync(DATA, JSON.stringify(data));
     console.log(`\n  placed ${rec.name} at ${r.lat},${r.lon} (manual — never auto-corrected)`);
-    console.log('  next:  node tools/seed-supabase.js --key <SERVICE_ROLE_KEY>\n');
+    console.log('  next:  SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js\n');
   }
   process.exit(0);
 }
@@ -267,7 +267,7 @@ function startsSheet(wb) {
     + (wrote ? '' : ' (attempt records only — no coordinates changed)'));
   if (wrote) {
     console.log('  next:  node tools/validate.js');
-    console.log('  then:  node tools/seed-supabase.js --key <SERVICE_ROLE_KEY>');
+    console.log('  then:  SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js');
   }
   console.log('');
 })().catch(e => {

@@ -320,7 +320,10 @@ end $$;
 --  Load the current committed documents into the table before pointing the site
 --  at it, so the first read returns real data:
 --
---      node tools/seed-supabase.js --url <SUPABASE_URL> --key <SERVICE_OR_ANON>
+--      SUPABASE_KEY=<SERVICE_KEY> node tools/seed-supabase.js --url <SUPABASE_URL>
+--
+--  Keep the key in the environment rather than in --key, which would leave it in
+--  your shell history.
 --
 --  That script reads data.json and people.json from the repo and upserts them as
 --  key='orlando'. It leaves the files in place; index.html falls back to them if
