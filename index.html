@@ -858,7 +858,19 @@ const SAME_NAME_MAX_M = 25000;
 // Trailing size/type designators, stripped to leave the development name:
 //   Waterlin 40RL · Wellness2 40FL · Hunt Club 50GC · Reedy 50 Classic
 //   Westview Villa · Edgewater MJR · Crosswinds 2 50 · Grenelefe 60M
-const DESIGNATOR = /^(\d+[a-z]*|th|gc|aa|rl|fl|mjr|m|villa|classic|majors)$/i;
+//
+// SF/PAR/CLA/VIL/MAJ matter as much as TH does, and leaving them out was a real
+// bug rather than an omission: "Cypress Rsrv TH" reduced to "cypress rsrv" while
+// "Cypress Rsrv SF" stayed "cypress rsrv sf", so two phases of one development
+// were different developments to this rule. They then fell through to the 400 m
+// distance fallback, which two phases laid out along a road routinely exceed —
+// and the map drew two pins almost on top of each other.
+//
+// This list MUST stay identical to map-core.js's. That file decides which
+// communities may vouch for each other's location and this one decides which
+// share a pin, and a divergence means the two disagree about what a development
+// is. A test compares them by behaviour over every real community name.
+const DESIGNATOR = /^(\d+[a-z]*|th|gc|aa|rl|fl|mjr|m|villa|classic|majors|sf|par|cla|vil|maj)$/i;
 
 function developmentOf(name) {
   const t = String(name).split(/\s+/);

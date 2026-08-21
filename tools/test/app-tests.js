@@ -307,6 +307,38 @@ async function boot(opts = {}) {
     }
   });
 
+  /* The bug a user hit on the live map: two phases of one development drawn as
+     two pins almost on top of each other.
+
+     index.html's designator list was missing SF, so "Cypress Rsrv TH" reduced to
+     "cypress rsrv" while "Cypress Rsrv SF" stayed "cypress rsrv sf". Different
+     developments to the grouping rule, so they fell through to the 400 m
+     distance fallback — which two phases laid out along a road routinely exceed.
+
+     Deliberately placed ~890 m apart: far enough that ONLY the name rule can
+     merge them, so this fails if the designator lists drift apart again. Fixture
+     data rather than the real document, because Cypress Rsrv SF has no
+     coordinate on file and an unplaced community is not drawn at all. */
+  await test('two phases of one development merge by name, not by luck', async () => {
+    const w = await boot({ mutate: files => {
+      const cs = files['data.json'].communities;
+      const th = cs.find(c => c.name === 'Cypress Rsrv TH');
+      const sf = cs.find(c => c.name === 'Cypress Rsrv SF');
+      th.lat = 28.5393056; th.lon = -81.8099167;
+      sf.lat = 28.5473056; sf.lon = -81.8099167;   // ~890 m north
+    } });
+    const S2 = () => w.__state();
+    const nameOf = i => S2().communities[i].name;
+    const groups = S2().groups.map(g => g.members.map(nameOf));
+
+    const apart = groups.filter(g =>
+      g.includes('Cypress Rsrv SF') || g.includes('Cypress Rsrv TH'));
+    eq(apart.length, 1,
+       'Cypress Rsrv SF and TH share one pin — ' + JSON.stringify(apart));
+    assert(apart[0].includes('Cypress Rsrv SF') && apart[0].includes('Cypress Rsrv TH'),
+       'and both are on it');
+  });
+
   await test('one development spelled two ways still merges, on distance', () => {
     const nameOf = i => S().communities[i].name;
     const gn = S().groups.map(g => g.members.map(nameOf));

@@ -242,56 +242,74 @@ group('an attempt is recorded on the community, so a retry is informed');
 
 /* ── the development rule must agree with the map's own ──────────────────── */
 
-group('developmentOf matches the rule index.html groups pins by');
+group('developmentOf is the SAME rule index.html groups pins by');
 {
-  const fs = require('fs');
-  const path = require('path');
-  const html = fs.readFileSync(path.join(__dirname, '..', '..', 'index.html'), 'utf8');
+  const fs2 = require('fs');
+  const path2 = require('path');
+  const html = fs2.readFileSync(path2.join(__dirname, '..', '..', 'index.html'), 'utf8');
 
-  /* Two copies of a naming rule that must not disagree: this one decides which
-     communities can vouch for each other's location, and index.html's decides
-     which share a map pin. Rather than compare source, compare behaviour on the
-     names that actually exist. */
-  const m = html.match(/function developmentOf\(name\)\s*\{[\s\S]*?\n\}/);
-  ok(!!m, 'found developmentOf in index.html');
-  if (m) {
-    const theirs = new Function('DESIGNATOR', 'return ' + m[0].replace('function developmentOf', 'function'))(
-      /^(\d+[a-z]*|th|gc|aa|rl|fl|mjr|m|villa|classic|majors)$/i);
-    const names = ['Waterlin 40RL', 'Wellness2 40FL', 'Hunt Club 50GC', 'Reedy 50 Classic',
-                   'Westview Villa', 'Edgewater MJR', 'Crosswinds 2 50', 'Grenelefe 60M',
-                   'DeBary Village TH', 'Cypress Rsrv SF', 'Springhead 25GC'];
+  /* Two copies of one naming rule that must not disagree. This one decides which
+     communities may vouch for each other's LOCATION; index.html's decides which
+     share a map PIN. They are compared by behaviour rather than by source,
+     because the two files are written differently and only the answers matter.
+
+     This started life as a note printed to the console — it observed that
+     index.html stripped fewer designators and said "if pin grouping should
+     follow, update index.html to match." It should have followed, and nobody
+     read the note: "Cypress Rsrv TH" reduced to "cypress rsrv" while "Cypress
+     Rsrv SF" stayed "cypress rsrv sf", so two phases of one development were
+     different developments, fell through to the 400 m distance fallback, and
+     drew two pins on top of each other on the live map.
+
+     A divergence a test merely mentions is a divergence nobody fixes. It is an
+     assertion now. */
+  const fnM = html.match(/function developmentOf\(name\)\s*\{[\s\S]*?\n\}/);
+  const reM = html.match(/const DESIGNATOR = (\/\^\([^\n]*?\)\$\/i);/);
+  ok(!!fnM, 'found developmentOf() in index.html');
+  ok(!!reM, 'found its DESIGNATOR in index.html');
+
+  if (fnM && reM) {
+    /* The regex is READ from index.html, not copied into this file. The previous
+       version passed in a hardcoded literal, so it was comparing map-core
+       against a transcription of index.html rather than against index.html —
+       and would have gone on passing however either one changed. */
+    const theirs = new Function('DESIGNATOR',
+      'return ' + fnM[0].replace('function developmentOf', 'function'))(eval(reM[1]));
+
+    // Every name that actually exists, plus the shapes worth pinning explicitly.
+    const doc = JSON.parse(fs2.readFileSync(
+      path2.join(__dirname, '..', '..', 'data.json'), 'utf8'));
+    const names = doc.communities.map(c => c.name).concat([
+      'Waterlin 40RL', 'Wellness2 40FL', 'Hunt Club 50GC', 'Reedy 50 Classic',
+      'Westview Villa', 'Edgewater MJR', 'Crosswinds 2 50', 'Grenelefe 60M',
+      'DeBary Village TH', 'DeBary Village SF', 'Cypress Rsrv SF', 'Cypress Rsrv TH',
+      'Springhead 25GC', 'Something PAR', 'Something CLA', 'Something VIL', 'Something MAJ']);
+
     const diffs = names.filter(n => theirs(n) !== C.developmentOf(n))
                        .map(n => n + ': map="' + theirs(n) + '" core="' + C.developmentOf(n) + '"');
-    // map-core adds SF/PAR/CLA/VIL/MAJ, which index.html lacks; anything it
-    // strips, index.html must strip too, or the two disagree about siblings.
-    const worse = diffs.filter(d => {
-      const n = d.split(':')[0];
-      return theirs(n).length < C.developmentOf(n).length;
-    });
-    eq(worse, [], 'map-core never groups less aggressively than the map itself');
-    if (diffs.length) {
-      console.log('    note: map-core strips more designators than index.html does —');
-      for (const d of diffs) console.log('      ' + d);
-      console.log('    that is intentional (SF/VIL/MAJ were added for sibling matching),');
-      console.log('    but if pin grouping should follow, update index.html to match.');
-    }
+    eq(diffs, [], 'the two files agree on every community name, exactly');
+
+    // And the specific pairing that was broken, stated so a regression names itself.
+    eq(theirs('Cypress Rsrv SF'), theirs('Cypress Rsrv TH'),
+       'Cypress Rsrv SF and TH are one development to the map');
+    eq(theirs('DeBary Village SF'), theirs('DeBary Village TH'),
+       'and so are DeBary Village SF and TH');
+
+    /* A community known only by a number reduces to "" in BOTH files — that is
+       intended, and it is why each has an explicit `dev &&` guard before
+       comparing. Without those guards two unrelated numbered communities would
+       compare equal and merge on the 25 km same-development radius. Asserted
+       here so the emptiness stays a shared, deliberate property rather than
+       something one file quietly stops producing. */
+    eq(theirs('40521'), '', 'a community known only by a number reduces to nothing');
+    eq(C.developmentOf('40521'), '', 'in both files');
+    ok(/if \(dev && dev === developmentOf\(b\.name\)\)/.test(html),
+       'and index.html refuses to match on an empty development name');
   }
 }
 
-/* ── backtest against the real division ─────────────────────────────────────
-   The decisive test, and the only one that can catch a threshold set wrongly.
-
-   Replays every community whose true location is already known as if it had just
-   arrived: takes its real street list from the permit log, places a synthetic
-   geocoder hit for each one inside the real community, and injects an adversarial
-   extra street that resolves to a same-named road 60 km away — the exact failure
-   mode a geocoder produces for a street that does not exist yet.
-
-   Then checks two things. The resolver should place most of them, and it must
-   place NONE of them wrong.
-
-   Needs data.json plus the Orlando permit log; skips loudly without them. */
-
+/* The backtest needs the real workbook and SheetJS; both are optional, so it
+   skips cleanly and says so rather than failing on a machine without them. */
 const FIXTURES = process.env.GEO_FIXTURES || process.env.INTAKE_FIXTURES;
 let XLSX = null;
 try { XLSX = require('xlsx'); }
