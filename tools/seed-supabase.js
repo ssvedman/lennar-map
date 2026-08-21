@@ -36,9 +36,15 @@ const DEFAULT_URL = 'https://memhzqphludiruovuzwt.supabase.co';
 
 /* ------------------------------------------------------------------ args */
 
+/* A flag's value must not itself be a flag. `--row --dry-run` reads as a row
+   named "--dry-run", so the run both seeds the wrong key and does the write it
+   was being asked not to do — the one mistake here that is awkward to undo.
+   Treating a --something as a missing value falls back to the default, which is
+   what the caller who forgot the argument was going to get anyway. */
 function arg(name, fallback) {
   const i = process.argv.indexOf('--' + name);
-  return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+  const v = i !== -1 ? process.argv[i + 1] : undefined;
+  return v && !v.startsWith('--') ? v : fallback;
 }
 const has = name => process.argv.indexOf('--' + name) !== -1;
 
@@ -49,8 +55,34 @@ const LABEL    = arg('label', 'Orlando Division');
 const DRY      = has('dry-run');
 const ACTOR    = arg('by', 'seed-supabase.js');
 
+/* The key is a credential and --url decides where it is sent, so the two cannot
+   be trusted independently. An unvalidated host means a mistyped — or pasted —
+   URL forwards a service-role key to somebody else's server, and the request
+   looks completely ordinary while it happens. Only the project's own host, or
+   one explicitly allowed through the environment, gets to see it.
+
+   Deliberately the same function, the same override and the same wording as
+   locate-communities.js. Two tools that send the same key to the same project
+   but disagree about which hosts are acceptable are two separate things to
+   check, and the one nobody checks is the one that leaks. */
+function hostAllowed(u) {
+  let h;
+  try { h = new URL(u).host; } catch { return false; }
+  const ok = [new URL(DEFAULT_URL).host]
+    .concat((process.env.SUPABASE_ALLOWED_HOSTS || '').split(',').map(x => x.trim()).filter(Boolean));
+  return ok.indexOf(h) !== -1;
+}
+
 if (typeof fetch !== 'function') {
   console.error('This script needs Node 18 or newer (global fetch).');
+  process.exit(2);
+}
+/* Checked before anything is read, let alone sent. --dry-run is exempt because
+   it makes no request at all — it only prints the target it would have used. */
+if (!DRY && !hostAllowed(URL_BASE)) {
+  console.error(`Refusing to send the key to ${URL_BASE} — that is not the project host.`);
+  console.error('Set SUPABASE_ALLOWED_HOSTS to that host if it is deliberate, or --dry-run to');
+  console.error('check the payload without a key going anywhere.');
   process.exit(2);
 }
 if (!DRY && !KEY) {

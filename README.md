@@ -102,6 +102,15 @@ node tools/locate-communities.js --starts … --dry-run
 node tools/locate-communities.js --only "Ridgebrooke" --place "28.6607,-81.5458"
 ```
 
+It also cross-references **Community-DB**. A Community Information Sheet is filled in long
+before a community's first permit and carries *City, State, Zip* against a JDE number that
+normalises to the map's community number — an exact join. That locality narrows the
+geocoder's question from a whole state to a few square miles, and a postcode the sheet and
+the geocoder independently agree on is corroboration in its own right, since it rules out
+the same-named-street-in-another-town case directly. It is optional throughout: set
+`SUPABASE_KEY` to enable it, `--no-cis` to skip it, and an unreachable Community-DB never
+fails a run.
+
 What is left over needs a person, and Blueprint is where that happens — Data Intake's map
 card and the Health panel both list what is waiting and take a confirmation, a rejection or
 a typed coordinate. `--place` above is the same operation from the command line, for when
@@ -109,8 +118,9 @@ Blueprint is unavailable.
 
 Every attempt is recorded on the community as `geo`, so a retry is informed rather than
 blind and a proposal you have rejected is not offered again on the same evidence.
-`geoSource` records how a pin was arrived at — `agreement`, `sibling`, `confirmed` or
-`manual`. A hand-placed coordinate is never auto-corrected: `validate.js --fix` will report
+`geoSource` records how a pin was arrived at — `agreement`, `sibling`, `locality`,
+`confirmed` or `manual`. The `geo` block is stripped from `map_public`, since it names
+the staff who placed and rejected things; re-run `map_supabase_setup.sql` to apply that. A hand-placed coordinate is never auto-corrected: `validate.js --fix` will report
 one that disagrees with its own address, but will not move it.
 
 The rules all live in `map-core.js` and are unit-tested without a network. `geo-client.js`

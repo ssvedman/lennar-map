@@ -1234,7 +1234,14 @@ function metresBetween(a, b) {
 // simply close enough that separate pins would overlap.
 function sameGroup(a, b) {
   const d = metresBetween(a, b);
-  if (developmentOf(a.name) === developmentOf(b.name)) return d <= SAME_NAME_MAX_M;
+  /* An empty development name is not a match. developmentOf() strips trailing
+     designators and phase digits, so a community the sheets know only by its
+     number — "40521", "612 2" — reduces to "", and two of those would compare
+     equal and merge on the 25 km same-development radius despite having nothing
+     to do with each other. map-core's sibling search carries the same `&&
+     devName` guard for exactly this reason; this is the map-side half of it. */
+  const dev = developmentOf(a.name);
+  if (dev && dev === developmentOf(b.name)) return d <= SAME_NAME_MAX_M;
   return d <= MERGE_RADIUS_M;
 }
 
@@ -1370,6 +1377,13 @@ function buildMarkers() {
 // ─────────────────────────────────────────────
 // POPUPS
 // ─────────────────────────────────────────────
+// Every interpolation below goes through esc(), including the three that are
+// arithmetic results. That looks redundant — a sum of numbers cannot carry a
+// "<" — but it is only true while starts[] really does hold numbers, and this
+// document arrives from a database row that nothing in the browser validates.
+// A string element makes fyTotal() concatenate and Math.max() return NaN, and
+// the concatenated one lands in the popup as markup. Escaping uniformly costs
+// nothing and removes the need to remember which values were proven safe.
 function buildPopupHTML(c) {
   const total = fyTotal(c);
   const n3    = next3Total(c);
@@ -1386,7 +1400,7 @@ function buildPopupHTML(c) {
   }).join('');
 
   const n3Label = next3Idx.length > 0
-    ? `<div class="popup-next3">Next 3 mo: ${n3} starts</div>`
+    ? `<div class="popup-next3">Next 3 mo: ${esc(n3)} starts</div>`
     : '';
 
   const approxNote = c.approxGeo
@@ -1402,7 +1416,7 @@ function buildPopupHTML(c) {
       <div class="popup-totals">
         ${c.unforecasted
           ? `<div class="popup-total" style="color:#92400e;background:#fef3c7;padding:4px 10px;border-radius:8px;font-size:12px;">⚠ Starts not forecasted yet — schedule pending</div>`
-          : `<div class="popup-total">12-mo Total: ${total} starts</div>${n3Label}`
+          : `<div class="popup-total">12-mo Total: ${esc(total)} starts</div>${n3Label}`
         }
       </div>
     </div>
@@ -1412,7 +1426,7 @@ function buildPopupHTML(c) {
       <div class="popup-meta">
         <div class="popup-meta-item"><span>Community #</span>${esc(c.num)}</div>
         <div class="popup-meta-item"><span>Active Months</span>${activeMonths} / 12</div>
-        <div class="popup-meta-item"><span>Peak Month</span>${peak} starts</div>
+        <div class="popup-meta-item"><span>Peak Month</span>${esc(peak)} starts</div>
       </div>
       <div class="popup-staff">
         <!-- Community managers first: they are the contact a trade partner
@@ -1725,7 +1739,16 @@ function applyFilters(opts = {}) {
   filtered = filtered.filter(({c, idx}) => fyTotal(c) > 0 || c.unforecasted || force.includes(idx));
 
   if (currentFilter === 'active') {
-    filtered = filtered.filter(({c, idx}) => (c.starts[0] || 0) > 0 || force.includes(idx));
+    // "Active" means starting THIS month, which is not always index 0: a window
+    // beginning one month back is a state checkDataStart deliberately tolerates,
+    // and on such a file starts[0] is last month's figure. Reading it anyway is
+    // silently wrong in the direction nobody checks — the list still fills, just
+    // with the wrong communities. Fall back to 0 when today is outside the
+    // window entirely, since there is no better answer and the old behaviour is
+    // the least surprising one.
+    const cur = getCurrentIdx();
+    const nowIdx = cur >= 0 && cur < 12 ? cur : 0;
+    filtered = filtered.filter(({c, idx}) => (c.starts[nowIdx] || 0) > 0 || force.includes(idx));
   } else if (currentFilter === 'next3') {
     filtered = filtered.filter(({c, idx}) => next3Total(c) > 0 || force.includes(idx));
   }
@@ -1793,8 +1816,16 @@ function exportCSV() {
                 'Area Manager','12-mo Starts','Next 3 mo','Latitude','Longitude','Approx. location'];
   if (currentTrade) cols.push('Trade', 'Vendor');
 
+  // Quoting keeps the CSV well-formed; the leading apostrophe keeps Excel from
+  // EXECUTING it. A cell that opens with = + - @ or a tab/return is read as a
+  // formula on open, so a community named "=cmd|…" in the source spreadsheet
+  // becomes a live cell in every download of this export — and the values here
+  // come from workbooks other people maintain. The apostrophe is stripped on
+  // display, so the text still reads correctly. Same guard as the CSV exports in
+  // vendor-portal and Takeoff Flow, deliberately character-for-character.
   const cell = v => {
-    const s = v == null ? '' : String(v);
+    let s = v == null ? '' : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
 

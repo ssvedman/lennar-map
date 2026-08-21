@@ -18,6 +18,13 @@
  *                     no workbook and makes no network call. Recorded as
  *                     `manual`, which means nothing ever moves it again.
  *
+ *   --no-cis      skip the Community-DB lookup entirely
+ *   --division    which division's sheets to read (default orlando)
+ *
+ * SUPABASE_KEY in the environment enables the Community-DB cross-reference,
+ * which supplies each community's city and postcode. Optional: without it the
+ * run works exactly as before, just with less to go on.
+ *
  * Run after import-workbooks.js and before seed-supabase.js. Safe to re-run: a
  * community already located is skipped, and a community that cannot be resolved
  * is left exactly as it was with a note about what was tried.
@@ -46,17 +53,38 @@ const GEO = require('./geo-client.js');
 /* ── SheetJS ──────────────────────────────────────────────────────────────────
    Loaded here but not INSISTED on here: --place reads no workbook, and refusing
    to run it for want of a spreadsheet library would block the one path that is
-   supposed to work when everything else does not. */
+   supposed to work when everything else does not.
+
+   The ordinary resolution paths, plus XLSX_PATH when it is set. The
+   unconditional /tmp/node_modules fallback that used to be here is gone: on a
+   shared host that directory is writable by anyone, so an "xlsx" left there
+   runs as this tool — which reads SUPABASE_KEY out of the environment a few
+   lines below. XLSX_PATH serves the sandbox case it was there for, named by
+   whoever runs the tool rather than by whoever wrote to /tmp first. */
 let XLSX;
-for (const p of ['xlsx', path.join(process.env.XLSX_PATH || '/tmp/node_modules', 'xlsx')]) {
+const XLSX_PATHS = ['xlsx'];
+if (process.env.XLSX_PATH) XLSX_PATHS.push(path.join(process.env.XLSX_PATH, 'xlsx'));
+for (const p of XLSX_PATHS) {
   try { XLSX = require(p); break; } catch { /* keep looking */ }
 }
 
 /* ── args ─────────────────────────────────────────────────────────────────── */
 const args = process.argv.slice(2);
 const has = f => args.includes(f);
-const argOf = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
-const allOf = f => args.reduce((a, v, i) => (args[i - 1] === f ? a.concat(v) : a), []);
+/* A flag's value must not itself be a flag: `--starts --dry-run` is a forgotten
+   filename, and reading "--dry-run" as the value went looking for a workbook by
+   that name AND skipped the dry run that was asked for. Absent is the honest
+   answer, and absent is a case every caller here already handles. */
+const argOf = (f, d) => {
+  const i = args.indexOf(f);
+  const v = i >= 0 ? args[i + 1] : undefined;
+  return v && !v.startsWith('--') ? v : d;
+};
+/* Same rule, and it matters more here than for argOf: --only collecting a flag
+   as a community name matches nothing, so the run reports "0 communities
+   awaiting a location" and reads as a clean success. */
+const allOf = f => args.reduce(
+  (a, v, i) => (args[i - 1] === f && !String(v).startsWith('--') ? a.concat(v) : a), []);
 
 const STARTS = argOf('--starts', null);
 const DATA   = argOf('--data', path.join(__dirname, '..', 'data.json'));
@@ -66,6 +94,29 @@ const MAX    = +argOf('--max', 6);
 const ACCEPT_SINGLE = has('--accept-single');
 const COUNTY = argOf('--county', null);   // optional hint, e.g. "Volusia County"
 const PLACE  = argOf('--place', null);    // "28.6607,-81.5458", with --only
+
+/* Community-DB, read for its city/postcode per community. Optional throughout —
+   see fetchLocalities() below. The key comes from the environment by preference
+   for the same reason seed-supabase.js prefers it: a key on the command line is
+   written into shell history and is visible to anyone who can list processes. */
+const DEFAULT_URL = 'https://memhzqphludiruovuzwt.supabase.co';
+const URL_BASE = (argOf('--url', process.env.SUPABASE_URL || DEFAULT_URL) || '').replace(/\/+$/, '');
+
+/* The key is a credential and --url decides where it is sent, so the two cannot
+   be trusted independently. An unvalidated host means a mistyped — or pasted —
+   URL forwards a service-role key to somebody else's server, and the request
+   looks completely ordinary while it happens. Only the project's own host, or
+   one explicitly allowed through the environment, gets to see it. */
+function hostAllowed(u) {
+  let h;
+  try { h = new URL(u).host; } catch { return false; }
+  const ok = [new URL(DEFAULT_URL).host]
+    .concat((process.env.SUPABASE_ALLOWED_HOSTS || '').split(',').map(x => x.trim()).filter(Boolean));
+  return ok.indexOf(h) !== -1;
+}
+const KEY      = argOf('--key', process.env.SUPABASE_KEY || '');
+const DIVISION = argOf('--division', 'orlando');
+const NO_CIS   = has('--no-cis');
 
 /* Placing one by hand does not need the starts log, a geocoder or a network, so
    it is handled before any of that is required. Blueprint is the normal route;
@@ -94,7 +145,7 @@ if (PLACE) {
   if (DRY) {
     console.log(`\n  --dry-run: would place ${rec.name} at ${r.lat},${r.lon}\n`);
   } else {
-    fs.writeFileSync(DATA, JSON.stringify(data));
+    writeJsonAtomic(DATA, data);
     console.log(`\n  placed ${rec.name} at ${r.lat},${r.lon} (manual — never auto-corrected)`);
     console.log('  next:  SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js\n');
   }
@@ -114,6 +165,30 @@ if (!STARTS) {
 if (typeof fetch !== 'function') {
   console.error('this node build has no global fetch — needs node 18+');
   process.exit(2);
+}
+
+/* ── writing ──────────────────────────────────────────────────────────────────
+   Write beside the target, then rename over it — the same rule validate.js and
+   import-workbooks.js follow, and for the same reason. writeFileSync truncates
+   the file and then fills it, so an interruption in between leaves no data.json
+   worth parsing rather than a stale one.
+
+   This tool is the likeliest of the three to be interrupted: it makes one
+   network call per street at roughly a second apiece, so a run over a handful of
+   communities sits there for a minute or two looking idle, which is exactly when
+   somebody reaches for Ctrl-C. A rename within one directory is atomic, so every
+   reader sees either the whole old document or the whole new one — and the same
+   directory is not incidental, since a rename across devices is a copy, which is
+   the operation being avoided.                                                */
+function writeJsonAtomic(file, value) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(value));
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* already gone, or never written */ }
+    throw e;
+  }
 }
 
 /* ── read the streets out of the starts log ───────────────────────────────── */
@@ -138,6 +213,62 @@ function startsSheet(wb) {
        : wb.SheetNames[0];
 }
 
+/* ── where Community-DB thinks each community is ─────────────────────────────
+   NOTE ON THE KEY. This reads a SIBLING APPLICATION's table, and the key it uses
+   is the service role key, which bypasses row-level security everywhere. That is
+   not a design choice so much as the only thing that works from a command line:
+   cdb_cis is readable by a signed-in @lennar.com user and the anon key holds no
+   privileges on any table, so there is no lesser credential a script can present.
+
+   Two consequences worth being deliberate about. The host is validated before
+   the key is sent anywhere, above. And Blueprint — which HAS a signed-in session
+   — reads the same table through it instead, with RLS applying normally; that is
+   the better route and the one to prefer when both are available.
+
+   The permit log gives street names and nothing else. Community-DB's Community
+   Information Sheets give the other half — "City, State, Zip" and the permitting
+   municipality — against a JDE number that normalises to exactly the community
+   number the map uses. It is an exact join, not a name match.
+
+   Worth having for two reasons: it turns "SUNFISH DRIVE, FL, USA" into a
+   question about a few square miles, and a postcode both the sheet and the
+   geocoder agree on is independent corroboration that the street found is in the
+   right town. See the long comment in map-core.js.
+
+   ENTIRELY OPTIONAL. Without a key this returns nothing and the run proceeds
+   exactly as it did before — fewer communities resolve, none resolve wrongly.
+   The one thing it must not do is fail the run: a locator that stops working
+   because an unrelated database is unreachable is worse than one that never
+   read it. */
+async function fetchLocalities() {
+  if (NO_CIS) return { by: {}, note: '--no-cis: Community-DB was not consulted' };
+  if (!KEY) {
+    return { by: {}, note: 'no SUPABASE_KEY set, so Community-DB was not consulted — '
+      + 'set it to narrow the search with each community\'s city and postcode' };
+  }
+  if (!hostAllowed(URL_BASE)) {
+    return { by: {}, note: `refusing to send the key to ${URL_BASE} — not the project host. `
+      + 'Set SUPABASE_ALLOWED_HOSTS if that is deliberate' };
+  }
+  const url = `${URL_BASE}/rest/v1/cdb_cis`
+    + '?select=jde,status,data&jde=not.is.null'
+    + `&division=eq.${encodeURIComponent(DIVISION)}`;
+  try {
+    const res = await fetch(url, {
+      headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, Accept: 'application/json' }
+    });
+    if (!res.ok) {
+      return { by: {}, note: `Community-DB returned HTTP ${res.status} — continuing without it` };
+    }
+    const rows = await res.json();
+    const by = CORE.localitiesFrom(rows);
+    const n = Object.keys(by).length;
+    return { by, note: `Community-DB: ${rows.length} sheets read, ${n} with a usable locality` };
+  } catch (e) {
+    return { by: {}, note: `could not reach Community-DB (${(e && e.message) || e}) — continuing without it` };
+  }
+}
+
 /* ── run ──────────────────────────────────────────────────────────────────── */
 
 (async function main() {
@@ -149,6 +280,8 @@ function startsSheet(wb) {
   const find = { notes: [], problems: [] };
   const { streets } = CORE.parseStarts(rows, sheet, find);
 
+  const cis = await fetchLocalities();
+
   let queue = CORE.pendingLocations(data, streets);
   if (ONLY.length) {
     const want = new Set(ONLY.map(s => s.toLowerCase()));
@@ -157,6 +290,7 @@ function startsSheet(wb) {
 
   console.log('');
   console.log(`  sheet "${sheet}", ${rows.length} rows`);
+  console.log(`  ${cis.note}`);
   console.log(`  ${queue.length} communit${queue.length === 1 ? 'y' : 'ies'} awaiting a location`);
 
   if (!queue.length) {
@@ -186,8 +320,24 @@ function startsSheet(wb) {
 
     console.log(`    streets: ${q.streets.map(s => s.street).join(' | ')}`);
 
+    /* The locality narrows the geocoder's question AND is checked against its
+       answer. Both happen only when Community-DB has a sheet for this community;
+       otherwise every gate behaves exactly as it did before. */
+    const locality = cis.by[q.num] || null;
+    if (locality) {
+      console.log(`    ${locality.source} puts it in `
+        + [locality.city, locality.county && locality.county + ' County', locality.zip]
+            .filter(Boolean).join(', '));
+    }
+
     const cands = await GEO.streetsFor(q.streets, {
-      county: COUNTY, bbox: CORE.BBOX, maxLookups: MAX,
+      county: COUNTY, bbox: CORE.BBOX, maxLookups: MAX, locality,
+      /* Which answers are worth stopping early for — the same gates
+         resolveLocation applies, so the search does not give up after two
+         answers that were never going to count. */
+      accept: (h, street) => !!h && !h.error && CORE.inBox(h)
+        && CORE.sameStreet(street, h.matchedStreet)
+        && !((CORE.localityAgrees(locality, h) || {}).agrees === false),
       onProgress: name => process.stderr.write(`      looking up ${name}…\n`)
     });
 
@@ -195,7 +345,7 @@ function startsSheet(wb) {
        has looked at and said no to must not come back every week — that is how
        a weekly report becomes something nobody reads. */
     const result = CORE.resolveLocation(cands, located,
-      { name: q.name, rejected: (rec.geo && rec.geo.rejected) || [] });
+      { name: q.name, locality, rejected: (rec.geo && rec.geo.rejected) || [] });
 
     // Report what each lookup actually did, because "pending" without the
     // reasons is not actionable.
@@ -262,7 +412,7 @@ function startsSheet(wb) {
   /* Attempt records are written even when nothing was placed. That is the point
      of keeping them: the next run knows what has already been tried, and the UI
      can explain a pending community without re-deriving it. */
-  fs.writeFileSync(DATA, JSON.stringify(data));
+  writeJsonAtomic(DATA, data);
   console.log(`\n  wrote ${path.relative(process.cwd(), DATA)}`
     + (wrote ? '' : ' (attempt records only — no coordinates changed)'));
   if (wrote) {

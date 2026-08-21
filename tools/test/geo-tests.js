@@ -374,6 +374,483 @@ if (!XLSX || !FIXTURES || !require('fs').existsSync(FIXTURES)) {
   }
 }
 
+/* ── the locality Community-DB supplies ─────────────────────────────────── */
+
+group('reading a locality off a Community Information Sheet');
+{
+  eq(C.parseLocality('DeBary, FL 32713'),
+     { city: 'DeBary', state: 'FL', zip: '32713', county: null, raw: 'DeBary, FL 32713' },
+     'the ordinary form');
+  eq(C.parseLocality('Saint Cloud, Florida 34771-1234').zip, '34771',
+     'ZIP+4 is truncated — the map has no use for the +4');
+  eq(C.parseLocality('City of Debary').city, 'Debary',
+     '"City of" is boilerplate, not part of the name');
+
+  /* A county is NOT a city, and handing one to a geocoder as a city is how a
+     findable road becomes "no result". The permitting municipality column
+     genuinely contains both — "Polk County" and "City of Eustis" both appear. */
+  const polk = C.parseLocality('', 'Polk County');
+  eq(polk.county, 'Polk', 'a county is kept as a county');
+  eq(polk.city, null, 'and never used as a city');
+  eq(C.parseLocality('Unincorporated Osceola County').county, 'Osceola',
+     'however it is prefixed');
+
+  // The municipality is a fallback for the address line, never an override.
+  eq(C.parseLocality('Apopka, FL 32703', 'City of Ocoee').city, 'Apopka',
+     'the address line wins when both are present');
+  eq(C.parseLocality('', 'City of Ocoee').city, 'Ocoee', 'and fills in when it is not');
+
+  eq(C.parseLocality(''), null, 'an empty sheet field is no locality');
+  eq(C.parseLocality('n/a'), null, 'and neither is a filler word with no place in it');
+}
+
+group('matching a CIS locality to a geocoder answer');
+{
+  const loc = C.parseLocality('DeBary, FL 32713');
+
+  const vol = C.localityAgrees(loc, { matchedZip: '32713', via: 'free' });
+  eq([vol.agrees, vol.on, vol.strong, vol.asked],
+     [true, 'postcode 32713', true, false],
+     'a postcode the geocoder volunteered, agreeing, is the strong case');
+  ok(!C.localityAgrees(loc, { matchedZip: '32080' }).agrees,
+     'and postcodes disagreeing is a refusal');
+
+  eq(C.localityAgrees(loc, { matchedCity: 'Debary' }).agrees, true,
+     'a city name matches case-insensitively');
+  eq(C.localityAgrees(loc, { matchedCity: 'Debary' }).strong, false,
+     'but a town is not strong evidence — many roads share one');
+  ok(!C.localityAgrees(loc, { matchedCity: 'Saint Augustine Beach' }).agrees,
+     'a different town is a refusal');
+
+  /* The distinction that keeps this honest. Nothing to compare must read as NO
+     EVIDENCE, never as disagreement — most roads in a new subdivision carry no
+     city or postcode in OSM at all, and treating that as a refusal would reject
+     exactly the communities this is meant to help. */
+  eq(C.localityAgrees(loc, { matchedStreet: 'Sunfish Dr' }), null,
+     'a provider that reported no locality gives no evidence either way');
+  eq(C.localityAgrees(null, { matchedZip: '32713' }), null,
+     'and neither does a community with no sheet on file');
+}
+
+group('a disagreeing postcode inside an agreeing town is not a refusal');
+{
+  /* Straight from the live geocoder: it puts Rider Rain Lane in Apopka 32704,
+     while the sheet and the map's own address for that community both say
+     Apopka 32703. Neither is wrong exactly — postcode boundaries in
+     OpenStreetMap are approximate and a subdivision can straddle two.
+
+     Refusing on that made a CORRECT sheet worse than no sheet at all: the
+     community dropped from "proposed" to "pending" for having accurate data on
+     file. So the town decides refusals and the postcode decides placements. */
+  const loc = C.parseLocality('Apopka, FL 32703');
+  const hit = { lat: 28.6607, lon: -81.5458, precision: 'street', source: 'nominatim',
+                matchedStreet: 'Rider Rain Lane', matchedCity: 'Apopka',
+                matchedZip: '32704', via: 'free' };
+
+  const a = C.localityAgrees(loc, hit);
+  eq(a.agrees, true, 'the town agrees, so the answer is not refused');
+  eq(a.strong, false, 'but the postcodes differ, so it cannot place on its own');
+  eq(a.note, 'different postcode, same town', 'and the discrepancy is not hidden');
+
+  const r = C.resolveLocation([{ street: 'RIDER RAIN LN', hit: hit }], [],
+                              { name: 'Rider Rain', locality: loc });
+  eq(r.status, 'proposed', 'the outcome is a proposal');
+
+  // The floor this sets: having a sheet must never be worse than having none.
+  const blind = C.resolveLocation([{ street: 'RIDER RAIN LN', hit: hit }], [],
+                                  { name: 'Rider Rain' });
+  eq(r.status, blind.status,
+     'which is no worse than the same lookup with no sheet at all — accurate data '
+     + 'must never cost a community its place in the queue');
+}
+
+group('a postcode that was ASKED for cannot corroborate itself');
+{
+  /* The lookup narrows its first attempt by the sheet's own city and postcode.
+     Anything that attempt returns therefore carries that postcode by
+     construction — so comparing it back to the sheet proves nothing. The
+     agreement is guaranteed, not earned.
+
+     Left unchecked this is a route to the exact failure the whole file exists to
+     prevent: a transposed postcode on a hand-filled sheet, plus any same-named
+     street inside the wrong one, places a pin in the wrong town with nobody
+     asked. `via` is how the two are told apart. */
+  const loc = C.parseLocality('DeBary, FL 32713');
+
+  const asked = { lat: 28.88, lon: -81.31, precision: 'street', source: 'nominatim',
+                  matchedStreet: 'Sunfish Dr', matchedCity: 'DeBary',
+                  matchedZip: '32713', via: 'structured' };
+  const volunteered = Object.assign({}, asked, { via: 'free' });
+
+  eq(C.localityAgrees(loc, asked).strong, false,
+     'a constrained answer agreeing with the constraint is not strong evidence');
+  eq(C.localityAgrees(loc, asked).asked, true, 'and is marked as having been asked for');
+  eq(C.localityAgrees(loc, volunteered).strong, true,
+     'the same answer, volunteered, is');
+
+  const one = [{ street: 'SUNFISH DRIVE', hit: asked }];
+  const r = C.resolveLocation(one, [], { name: 'DeBary Village TH', locality: loc });
+  eq(r.status, 'proposed', 'so a lone street found that way is proposed, not placed');
+  ok(r.evidence.some(e => /not the same as the geocoder having agreed independently/.test(e)),
+     'and the proposal says exactly why: ' + JSON.stringify(r.evidence));
+
+  const r2 = C.resolveLocation([{ street: 'SUNFISH DRIVE', hit: volunteered }], [],
+                               { name: 'DeBary Village TH', locality: loc });
+  eq(r2.status, 'located', 'while the volunteered one places it');
+  eq(r2.confidence, 'locality', 'on the locality');
+
+  /* A DISAGREEMENT still counts either way. Refusing a wrong town never depended
+     on independence — the sheet saying one place and the answer being in another
+     is a conflict however the question was put. */
+  const wrong = Object.assign({}, asked, { matchedZip: '32080', matchedCity: 'Saint Augustine Beach' });
+  eq(C.localityAgrees(loc, wrong).agrees, false,
+     'a constrained answer that somehow disagrees is still refused');
+}
+
+group('two spellings of one town are not two towns');
+{
+  /* Live in this division: the map's own data says "St Cloud" and the geocoder
+     answers "Saint Cloud". Compared literally those are different towns — and a
+     differing town is a REFUSAL, so this one gap silently rejected correct
+     streets in every St, Ft and Mt community there is. It fails in the direction
+     that costs coverage while looking like caution, which is the hardest kind to
+     notice. */
+  ok(C.placeKey('St. Cloud') === C.placeKey('Saint Cloud'), 'St. Cloud is Saint Cloud');
+  ok(C.placeKey('St Cloud') === C.placeKey('Saint Cloud'), 'with or without the point');
+  ok(C.placeKey('Ft. Myers') === C.placeKey('Fort Myers'), 'and Ft is Fort');
+  ok(C.placeKey('Mt. Dora') === C.placeKey('Mount Dora'), 'and Mt is Mount');
+
+  // Only as a whole word, so a town that merely begins with those letters is
+  // left alone. There is no Saint Uart.
+  ok(C.placeKey('Stuart') !== C.placeKey('Saint Uart'), 'Stuart is not Saint Uart');
+
+  const loc = C.parseLocality('St Cloud, FL 34771');
+  eq(C.localityAgrees(loc, { matchedCity: 'Saint Cloud', via: 'free' }).agrees, true,
+     'so a correct street in St Cloud is no longer refused');
+}
+
+group('an agreeing postcode outranks a differing town name');
+{
+  /* Unincorporated Florida: every letter sent there says "Orlando" while OSM
+     names the census-designated place "Lake Nona". The postcodes agree, the town
+     names do not, and the street is perfectly correct.
+
+     Checking the town first refused it. A genuine wrong-town match disagrees on
+     the postcode as well, so it is still refused below — the ordering separates
+     the two cases without weakening either. */
+  const loc = C.parseLocality('Orlando, FL 32832');
+  const a = C.localityAgrees(loc, { matchedCity: 'Lake Nona', matchedZip: '32832',
+                                    via: 'free', cityAuthoritative: true });
+  eq(a.agrees, true, 'the postcodes agree, so it is not refused over the town name');
+  eq(a.strong, true, 'and it is still strong enough to place on');
+  ok(/unincorporated/.test(a.note || ''), 'with the discrepancy stated, not hidden');
+
+  // The case this all exists for is untouched: its postcode differs too.
+  const d = C.parseLocality('DeBary, FL 32713');
+  eq(C.localityAgrees(d, { matchedCity: 'Saint Augustine Beach', matchedZip: '32080',
+                           via: 'free', cityAuthoritative: true }).agrees, false,
+     'a genuine wrong-town match still disagrees on both and is refused');
+}
+
+group('a neighbourhood name may agree but never refuse');
+{
+  /* Nominatim answers with whatever it has: city, town, village, hamlet,
+     suburb. Only the first few are municipalities — the rest are often a
+     subdivision or a CDP that no postal address uses. Letting one of those
+     refuse a street would reject correct answers on the strength of a name
+     nobody outside OSM uses. */
+  const loc = C.parseLocality('Orlando, FL');
+  eq(C.localityAgrees(loc, { matchedCity: 'Meadow Woods', cityAuthoritative: false,
+                             via: 'free' }), null,
+     'a weak place type that disagrees is no evidence, not a refusal');
+  eq(C.localityAgrees(loc, { matchedCity: 'Orlando', cityAuthoritative: true,
+                             via: 'free' }).agrees, true,
+     'while a real municipality that agrees still counts');
+}
+
+group('a name matching several roads cannot place on the postcode alone');
+{
+  /* The geocoder is asked for five results and only one was ever used, so a
+     street name matching three different roads looked identical to one matching
+     exactly one — and the postcode path would place the first of them. That is a
+     coin flip wearing the clothes of corroboration. */
+  const loc = C.parseLocality('Apopka, FL 32703');
+  const hit = { lat: 28.6607, lon: -81.5458, precision: 'address', source: 'nominatim',
+                matchedStreet: 'Rider Rain Lane', matchedCity: 'Apopka',
+                matchedZip: '32703', via: 'free', cityAuthoritative: true,
+                asked: { city: false, county: false, zip: false },
+                others: [{ lat: 28.9, lon: -81.9, matchedStreet: 'Rider Rain Ln' }] };
+
+  const r = C.resolveLocation([{ street: 'RIDER RAIN LN', hit: hit }], [],
+                              { name: 'X', locality: loc });
+  eq(r.status, 'proposed', 'an ambiguous name is proposed, not placed');
+  ok(/more than one road/.test(r.why), 'and says so: ' + r.why);
+
+  // The same answer with no rival roads places, as before.
+  const solo = Object.assign({}, hit, { others: [] });
+  eq(C.resolveLocation([{ street: 'RIDER RAIN LN', hit: solo }], [],
+                       { name: 'X', locality: loc }).status, 'located',
+     'one road of that name still places');
+}
+
+group('what was asked for is tracked field by field');
+{
+  /* One flag for the whole request was wrong in both directions. The free-form
+     query still names the COUNTY, so a county agreement on that path is exactly
+     as circular as a postcode one on the structured path — and a per-request
+     flag called it volunteered. */
+  const loc = C.parseLocality('', 'Volusia County');
+  const a = C.localityAgrees(loc, { matchedCounty: 'Volusia', via: 'free',
+                                    asked: { city: false, county: true, zip: false } });
+  eq(a.agrees, true, 'the county agrees');
+  eq(a.asked, true, 'but it was named in the query, so it is marked as asked for');
+  eq(a.strong, false, 'and a county never places anything regardless');
+}
+
+group('a locality catches the wrong-town match nothing else can see');
+{
+  /* This is a real answer from the live geocoder, not an invented one. Asked for
+     SUNFISH DRIVE it returns Sunfish Drive in Saint Augustine Beach — which
+     passes the name gate exactly, and passes the bounding box, because St
+     Augustine is inside the division's box. Only corroboration stands between
+     that and a pin 180 km from the community. */
+  const wrongTown = [{ street: 'SUNFISH DRIVE', hit: {
+    lat: 29.8459, lon: -81.2764, precision: 'address', source: 'nominatim',
+    matchedStreet: 'Sunfish Drive', matchedCity: 'Saint Augustine Beach', matchedZip: '32080' } }];
+
+  const blind = C.resolveLocation(wrongTown, [], { name: 'DeBary Village TH' });
+  eq(blind.status, 'proposed',
+     'with nothing to check it against, the best that can be done is to ASK');
+
+  const loc = C.parseLocality('DeBary, FL 32713');
+  const seeing = C.resolveLocation(wrongTown, [], { name: 'DeBary Village TH', locality: loc });
+  eq(seeing.status, 'pending', 'with the sheet on file it is refused outright');
+  ok(/not where/.test(seeing.why) && /Saint Augustine Beach/.test(seeing.why),
+     'and the reason names both places: ' + seeing.why);
+
+  /* The refusal is allowed here and ONLY here — nothing corroborates this point
+     but itself. Once anything else does, the sheet loses its veto; see below. */
+  const sib = [{ name: 'DeBary Village SF', lat: 29.8470, lon: -81.2770 }];
+  eq(C.resolveLocation(wrongTown, sib, { name: 'DeBary Village TH', locality: loc }).status,
+     'proposed', 'with a sibling agreeing, the sheet can only question it');
+}
+
+group('the sheet cannot overrule two streets that agree');
+{
+  /* This was wrong when first written. The locality check ran per candidate and
+     DROPPED anything that disagreed, which took it out of the agreement cluster
+     too — so one hand-typed field on a sheet could override two independent
+     streets landing on the same patch of ground. That inverts the evidence: two
+     streets agreeing is the strongest signal this file has, and a town typed
+     into a spreadsheet is among the weakest.
+
+     Worse, the narrowed lookup SENDS the city, so a disagreement could only ever
+     surface on the free-form fallback — the path that new-subdivision roads take.
+     The veto was aimed squarely at the communities it exists to help. */
+  const loc = C.parseLocality('DeBary, FL 32713');
+  const two = [
+    { street: 'SUNFISH DR', hit: { lat: 28.660, lon: -81.540, precision: 'address',
+      source: 'nominatim', matchedStreet: 'Sunfish Dr', matchedCity: 'Sanford',
+      matchedZip: '32771', via: 'free' } },
+    { street: 'MAHI PL', hit: { lat: 28.662, lon: -81.542, precision: 'address',
+      source: 'nominatim', matchedStreet: 'Mahi Pl', matchedCity: 'Sanford',
+      matchedZip: '32771', via: 'free' } }
+  ];
+
+  const r = C.resolveLocation(two, [], { name: 'DeBary Village TH', locality: loc });
+  eq(r.status, 'proposed', 'the streets are not thrown away for disagreeing with the sheet');
+  eq(r.confidence, 'agreement', 'and it is still recorded as an agreement');
+  ok(/one of the two is wrong/.test(r.why),
+     'but it is not applied unwatched either: ' + r.why);
+  ok(r.lat === 28.661, "the point is the streets' own, not the sheet's");
+
+  // With no sheet at all, the identical evidence places it. The sheet's only
+  // effect is to stop it happening without somebody looking.
+  eq(C.resolveLocation(two, [], { name: 'DeBary Village TH' }).status, 'located',
+     'the same two streets with no sheet on file are placed');
+}
+
+group('two spellings of one road are not two streets');
+{
+  /* The permit log writes "SUNFISH DR" on one lot and "SUNFISH DRIVE" on the
+     next. Counted separately, a single road corroborated ITSELF into an
+     automatic placement — which is the agreement rule's entire claim, undone.
+     It is the likeliest route to a wrong pin that survived every other gate,
+     because both halves are genuinely the right street name. */
+  const one = (lat, lon, st) => ({ lat, lon, precision: 'address',
+    source: 'nominatim', matchedStreet: st, via: 'free' });
+
+  const r = C.resolveLocation([
+    { street: 'SUNFISH DR', hit: one(28.660, -81.540, 'Sunfish Dr') },
+    { street: 'SUNFISH DRIVE', hit: one(28.662, -81.542, 'Sunfish Drive') }
+  ], [], { name: 'X' });
+  eq(r.status, 'proposed', 'one road written twice does not agree with itself');
+  ok(r.tried.some(t => /written differently/.test(t.result)),
+     'and the audit trail says why it was not counted: ' + JSON.stringify(r.tried));
+
+  // Two genuinely different streets are unaffected.
+  eq(C.resolveLocation([
+    { street: 'SUNFISH DR', hit: one(28.660, -81.540, 'Sunfish Dr') },
+    { street: 'MAHI PL', hit: one(28.662, -81.542, 'Mahi Pl') }
+  ], [], { name: 'X' }).status, 'located', 'two real streets still agree');
+
+  // Direction and type synonyms are the same road too.
+  eq(C.resolveLocation([
+    { street: 'N MAIN ST', hit: one(28.660, -81.540, 'N Main St') },
+    { street: 'NORTH MAIN STREET', hit: one(28.662, -81.542, 'North Main Street') }
+  ], [], { name: 'X' }).status, 'proposed', 'and so are direction synonyms');
+}
+
+group('a proposal says how many streets actually resolved');
+{
+  /* "Only one street resolved" was printed even when four had and simply landed
+     nowhere near each other. That is a different situation with a different fix,
+     and reading it as "one" is what makes --accept-single look reasonable when
+     it is not. */
+  const at = (lat, lon, st) => ({ lat, lon, precision: 'address',
+    source: 'nominatim', matchedStreet: st, via: 'free' });
+  const r = C.resolveLocation([
+    { street: 'ALPHA DR', hit: at(28.60, -81.50, 'Alpha Dr') },
+    { street: 'BETA LN', hit: at(28.90, -81.90, 'Beta Ln') },
+    { street: 'GAMMA CT', hit: at(29.20, -82.20, 'Gamma Ct') }
+  ], [], { name: 'X' });
+  eq(r.status, 'proposed', 'scattered streets are proposed, not placed');
+  ok(/3 streets resolved/.test(r.why), 'and the count is honest: ' + r.why);
+  ok(/km apart/.test(r.why), 'with how far apart they landed');
+  ok(!/only one street resolved/.test(r.why), 'never "only one"');
+}
+
+group('a postcode both sources agree on is enough to place one street');
+{
+  const loc = C.parseLocality('Apopka, FL 32704');
+  loc.source = 'Community-DB CIS';
+  const one = [{ street: 'RIDER RAIN LN', hit: {
+    lat: 28.6607, lon: -81.5458, precision: 'address', source: 'nominatim',
+    matchedStreet: 'Rider Rain Lane', matchedCity: 'Apopka', matchedZip: '32704',
+    via: 'free' } }];
+
+  /* The claim being made: a human filling in a sheet months ago and a mapping
+     service today cannot have copied each other, so their agreeing on the
+     postcode is independent corroboration — the same KIND of evidence the
+     two-streets rule looks for, arriving from a different direction. */
+  const r = C.resolveLocation(one, [], { name: 'Rider Rain', locality: loc });
+  eq(r.status, 'located', 'one street plus an agreeing postcode places it');
+  eq(r.confidence, 'locality', 'recorded as having been placed on the locality');
+  ok(/Community-DB/.test(r.evidence[0]), 'and says where the corroboration came from');
+
+  // Without it, exactly the same street is only a proposal. Nothing else changed.
+  eq(C.resolveLocation(one, [], { name: 'Rider Rain' }).status, 'proposed',
+     'the same evidence minus the sheet is still only a proposal');
+}
+
+group('a town is not a location');
+{
+  /* The line this draws. A postcode is a few square miles; a municipality can be
+     twenty across, and "roughly the right area" is not evidence of a location —
+     that is the whole reason the agreement radius is 1.5 km and not 15. So a
+     city-only agreement makes a better PROPOSAL, never a placement. */
+  const loc = C.parseLocality('Apopka, FL');       // no ZIP on this sheet
+  const one = [{ street: 'RIDER RAIN LN', hit: {
+    lat: 28.6607, lon: -81.5458, precision: 'address', source: 'nominatim',
+    matchedStreet: 'Rider Rain Lane', matchedCity: 'Apopka', matchedZip: null } }];
+
+  const r = C.resolveLocation(one, [], { name: 'Rider Rain', locality: loc });
+  eq(r.status, 'proposed', 'a matching town alone does not place it');
+  ok(r.evidence.some(e => /a town is not a location/.test(e)),
+     'and the proposal says why it is only a proposal: ' + JSON.stringify(r.evidence));
+}
+
+group('a road with no address tags is not punished for it');
+{
+  /* Most roads in a subdivision built last year carry no city or postcode in
+     OSM. If a missing field read as a refusal, this whole feature would reject
+     precisely the communities it exists to place. */
+  const loc = C.parseLocality('Davenport, FL 33837');
+  const bare = [
+    { street: 'PLANK PL', hit: { lat: 28.2048, lon: -81.6471, precision: 'street',
+      source: 'nominatim', matchedStreet: 'Plank Place', matchedCity: null, matchedZip: null } },
+    { street: 'SECOND ST', hit: { lat: 28.2060, lon: -81.6480, precision: 'street',
+      source: 'nominatim', matchedStreet: 'Second St', matchedCity: null, matchedZip: null } }
+  ];
+  const r = C.resolveLocation(bare, [], { name: 'Somewhere', locality: loc });
+  eq(r.status, 'located', 'two agreeing streets still place it');
+  eq(r.confidence, 'agreement', 'on agreement, exactly as before the sheet existed');
+}
+
+group('one road is looked up once, not once per spelling');
+{
+  const doc = { communities: [{ num: '1', name: 'X', lat: null, lon: null, starts: [] }] };
+  const streets = { '1': { 'SUNFISH DR': 3, 'SUNFISH DRIVE': 14, 'MAHI PL': 6 } };
+  const got = C.pendingLocations(doc, streets)[0].streets;
+
+  /* Two spellings of one road cost two geocoder requests at a second apiece to
+     learn the same fact twice — and resolveLocation has to discard the duplicate
+     at the far end anyway. Merged here, before anything is asked. */
+  eq(got.length, 2, 'the two spellings of Sunfish are one entry');
+  eq(got[0], { street: 'SUNFISH DRIVE', lots: 17 },
+     'keeping the spelling the log favours, and the combined lot count');
+  eq(got[1].street, 'MAHI PL', 'and the genuinely different road survives');
+}
+
+group('the audit trail is not published to the world');
+{
+  /* Locating writes who did what onto the community: placedBy, confirmedBy and
+     rejected[].by are staff email addresses, and rejection reasons are free text
+     somebody typed. All of it lives INSIDE payload.
+
+     map_public is the only object anon can read, and it already refuses to
+     publish updated_by for being one staff email — so geo travelling through
+     inside payload would have walked a whole audit trail through the door that
+     column was kept out of. The view strips it. Asserted here because the SQL
+     cannot be run from a test, and a security property nobody checks is a
+     security property that regresses. */
+  const sql = require('fs').readFileSync(
+    require('path').join(__dirname, '..', '..', 'map_supabase_setup.sql'), 'utf8');
+
+  const view = sql.slice(sql.indexOf('create view public.map_public'),
+                         sql.indexOf('revoke all on public.map_public'));
+  ok(/-\s*'geo'/.test(view), 'the view subtracts geo from each community');
+  ok(/jsonb_set\(payload, '\{communities\}'/.test(view),
+     'and rebuilds payload around it rather than dropping payload wholesale');
+  ok(/SECURITY: % communities still expose a geo block/.test(sql),
+     'and the script asserts afterwards that none is reachable');
+}
+
+group('joining Community-DB rows to map communities');
+{
+  /* The join is the JDE number through normCommunityId — the same function the
+     permit log goes through — so it is exact rather than a name match, and both
+     lot-number widths land on the same community. */
+  const rows = [
+    { jde: '2641672', status: 'published', data: { f: { city_state_zip: 'DeBary, FL 32713' } } },
+    { jde: '1114972', status: 'published', data: { f: { city_state_zip: 'Apopka, FL 32703' } } },
+    { jde: '9999999', status: 'published', data: { f: {} } },
+    { jde: '', status: 'published', data: { f: { city_state_zip: 'Nowhere, FL' } } }
+  ];
+  const by = C.localitiesFrom(rows);
+  eq(Object.keys(by).sort(), ['11149720000', '26416720000'],
+     "keyed by the map's community number, and a sheet with no locality is skipped");
+  eq(by['26416720000'].zip, '32713', 'with the locality attached');
+  ok(/Community-DB/.test(by['26416720000'].source), 'and where it came from');
+
+  /* Publish is the act that says a value is meant to be believed — the same rule
+     the map follows everywhere else — so a draft never shadows a published row. */
+  const both = C.localitiesFrom([
+    { jde: '2641672', status: 'draft', data: { f: { city_state_zip: 'Sanford, FL 32771' } } },
+    { jde: '2641672', status: 'published', data: { f: { city_state_zip: 'DeBary, FL 32713' } } }
+  ]);
+  eq(both['26416720000'].city, 'DeBary', 'the published row wins over a draft');
+
+  // But a draft on its own is better than nothing, and says that it is a draft.
+  const draftOnly = C.localitiesFrom([
+    { jde: '2641672', status: 'draft', data: { f: { city_state_zip: 'Sanford, FL 32771' } } }
+  ]);
+  eq(draftOnly['26416720000'].city, 'Sanford', 'a draft is used when it is all there is');
+  ok(/draft/.test(draftOnly['26416720000'].source), 'and is labelled as one');
+
+  eq(C.localitiesFrom(null), {}, 'no rows at all is not an error');
+}
+
 /* ── a coordinate typed by a person ─────────────────────────────────────── */
 
 group('reading a coordinate somebody pasted in');

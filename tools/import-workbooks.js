@@ -38,9 +38,19 @@ const fs = require('fs');
 const path = require('path');
 const CORE = require('./map-core.js');
 
-/* ── SheetJS ──────────────────────────────────────────────────────────────── */
+/* ── SheetJS ──────────────────────────────────────────────────────────────────
+   The ordinary resolution paths, and XLSX_PATH if somebody set one. There was
+   an unconditional fallback to /tmp/node_modules here, which is a directory any
+   user of a shared host can write to: dropping an "xlsx" there is enough to run
+   arbitrary code inside this process, and this process is normally started from
+   a shell that has SUPABASE_KEY exported for the seed step. The fallback only
+   ever existed for a sandbox that could not install into the repo, and XLSX_PATH
+   covers that case already — with the difference that the path was named by
+   whoever ran the tool rather than by whoever got there first.                 */
 let XLSX;
-for (const p of ['xlsx', path.join(process.env.XLSX_PATH || '/tmp/node_modules', 'xlsx')]) {
+const XLSX_PATHS = ['xlsx'];
+if (process.env.XLSX_PATH) XLSX_PATHS.push(path.join(process.env.XLSX_PATH, 'xlsx'));
+for (const p of XLSX_PATHS) {
   try { XLSX = require(p); break; } catch { /* keep looking */ }
 }
 if (!XLSX) {
@@ -51,7 +61,16 @@ if (!XLSX) {
 /* ── args ─────────────────────────────────────────────────────────────────── */
 const args = process.argv.slice(2);
 const has = f => args.includes(f);
-const argOf = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
+/* A flag's value must not itself be a flag. `--starts --dry-run` is a forgotten
+   filename, and swallowing the next argument gave the worst of both readings:
+   the run went looking for a workbook called "--dry-run" AND did not do the dry
+   run that was asked for. Absent is the honest answer, and every caller here
+   already has something sensible to do with absent. */
+const argOf = (f, d) => {
+  const i = args.indexOf(f);
+  const v = i >= 0 ? args[i + 1] : undefined;
+  return v && !v.startsWith('--') ? v : d;
+};
 
 const RE2_FILE      = argOf('--re2', null);
 const STARTS_FILE   = argOf('--starts', null);
@@ -71,6 +90,23 @@ const DRY      = has('--dry-run');
 if (!RE2_FILE && !STARTS_FILE && !CONTACTS_FILE) {
   console.error('nothing to do — pass --starts, --re2 and/or --contacts');
   process.exit(2);
+}
+
+/* ── writing ──────────────────────────────────────────────────────────────────
+   Beside the target, then rename over it. writeFileSync truncates first and
+   fills after, so an interruption between the two leaves half a document —
+   which is not a data error the next run can report, it is a file nothing can
+   parse. A rename within the same directory is atomic, and the directory has to
+   be the same one, since a rename across devices is a copy.                    */
+function writeJsonAtomic(file, value) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(value));
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* already gone, or never written */ }
+    throw e;
+  }
 }
 
 /* ── sheet access ─────────────────────────────────────────────────────────── */
@@ -167,8 +203,16 @@ function main() {
     return;
   }
 
-  fs.writeFileSync(DATA, JSON.stringify(result.next));
-  fs.writeFileSync(PEOPLE, JSON.stringify(result.people));
+  /* People first, then data. The two files are one document in two pieces and
+     there is no way to replace both at once, so the order decides what a crash
+     in between leaves behind. data.json refers to people by id; people.json
+     refers to nothing. Writing people first leaves, at worst, a contact nobody
+     links to yet — which validate.js already reports as a warning, and which
+     the map never renders. The other order leaves communities pointing at ids
+     that do not exist, which validate.js calls an error and the popup renders
+     as a manager who has vanished. */
+  writeJsonAtomic(PEOPLE, result.people);
+  writeJsonAtomic(DATA, result.next);
   console.log(`\n  wrote ${path.relative(process.cwd(), DATA)}`);
   console.log('  next:  node tools/validate.js --fix');
   console.log('  then:  SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js\n');

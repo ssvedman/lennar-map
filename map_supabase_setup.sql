@@ -155,7 +155,19 @@ grant select, insert         on public.map_change_log to authenticated;
 drop view if exists public.map_public;
 create view public.map_public
   with (security_invoker = false) as
-  select key, label, payload, people, updated_at
+  select key, label,
+         -- payload MINUS each community's `geo` block. See the comment below:
+         -- that block carries staff email addresses, and this view exists partly
+         -- to keep those away from anon.
+         case
+           when jsonb_typeof(payload -> 'communities') = 'array' then
+             jsonb_set(payload, '{communities}',
+               coalesce((select jsonb_agg(c - 'geo')
+                           from jsonb_array_elements(payload -> 'communities') as c),
+                        '[]'::jsonb))
+           else payload
+         end as payload,
+         people, updated_at
     from public.map_data;
 
 revoke all on public.map_public from anon, authenticated;
@@ -163,8 +175,39 @@ grant select on public.map_public to anon, authenticated;
 
 comment on view public.map_public is
   'Read-only public projection of map_data for the unauthenticated Community Map. '
-  'Deliberately omits prev_payload, prev_people, prev_updated_at and updated_by. '
+  'Deliberately omits prev_payload, prev_people, prev_updated_at and updated_by, '
+  'and strips each community''s geo block out of payload. '
   'This view is the only object in this database readable by anon.';
+
+-- WHY geo IS STRIPPED
+-- Locating a community records an audit trail on the community itself: what was
+-- tried, what was proposed, what a person rejected, and WHO did each — placedBy,
+-- confirmedBy, rejected[].by are staff email addresses, and rejection reasons are
+-- free text somebody typed.
+--
+-- That is exactly the kind of value this view already refuses to publish: it
+-- omits updated_by for being one staff email. Because geo lives INSIDE payload
+-- rather than in a column of its own, it would otherwise have travelled straight
+-- through the same door the column was kept out of — a whole audit trail, served
+-- to anyone on the internet, through a view whose stated purpose is to prevent
+-- that.
+--
+-- map_data keeps it in full; Blueprint reads it from there, signed in. The public
+-- map has never read geo and does not need it.
+
+do $$
+declare v_leak int;
+begin
+  select count(*) into v_leak
+    from public.map_public,
+         lateral jsonb_array_elements(coalesce(payload -> 'communities', '[]'::jsonb)) as c
+   where c ? 'geo';
+  if v_leak > 0 then
+    raise exception 'SECURITY: % communities still expose a geo block through map_public — it carries staff email addresses', v_leak;
+  end if;
+  raise notice 'map_public: no geo block reachable by anon (checked % row(s))',
+    (select count(*) from public.map_public);
+end $$;
 
 -- ---------------------------------------------------------------------------
 -- 4. Policies on the base table (signed-in staff only)

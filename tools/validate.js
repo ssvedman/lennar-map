@@ -22,7 +22,10 @@ const args = process.argv.slice(2);
 const has = f => args.includes(f);
 const argOf = (flag, dflt) => {
   const i = args.indexOf(flag);
-  return i >= 0 && args[i + 1] ? args[i + 1] : dflt;
+  // A following flag is not a value: `--data --fix` means --data was given
+  // no path, not that the path is "--fix".
+  const v = i >= 0 ? args[i + 1] : undefined;
+  return v && !v.startsWith('--') ? v : dflt;
 };
 
 const DATA = argOf('--data', path.join(__dirname, '..', 'data.json'));
@@ -41,6 +44,17 @@ const NEAR_DUP_M      = 25;     // closer than this, effectively the same point
 
 // Orlando division bounding box. A geocode outside it is wrong, full stop.
 const BBOX = { minLat: 26.5, maxLat: 30.5, minLon: -83.0, maxLon: -80.0 };
+
+/* Every `geoSource` this tooling knows how to read: the values map-core's
+   applyLocation() and acceptProposal() write, plus the `single` that
+   locate-communities --accept-single records, plus `manual`. See the WRITING A
+   LOCATION ONTO A COMMUNITY comment in map-core.js — that is the list this one
+   has to stay in step with. What matters below is not which of these a pin
+   carries so much as whether it carries one of them AT ALL: a geoSource this
+   file has never heard of came from something we cannot reason about, and the
+   safe reading of an unreadable provenance is "leave it alone".               */
+const AUTO_GEO_SOURCES = new Set(['agreement', 'sibling', 'locality', 'single', 'confirmed']);
+const KNOWN_GEO_SOURCES = new Set([...AUTO_GEO_SOURCES, 'manual']);
 
 /* ── geocoding providers ─────────────────────────────────────────────────────
    Behind one interface so the chain can be reordered, and so the checks can be
@@ -152,9 +166,14 @@ function checkSchema(data, people) {
   if (!/^\d{4}-\d{2}$/.test(data.dataStart || '')) {
     err('data.json', `dataStart "${data.dataStart}" is not YYYY-MM`);
   } else {
+    /* UTC on both sides. map-core's currentDataStart() stamps the month from
+       getUTCMonth(), so on an evening east of UTC — or any evening at all, from
+       here — local time is still in the previous month while the file correctly
+       says the next one. Comparing the two calendars made this reject a file it
+       had just watched import-workbooks write, for a few hours a month. */
     const [y, m] = data.dataStart.split('-').map(Number);
     const now = new Date();
-    const offset = (now.getFullYear() * 12 + now.getMonth() + 1) - (y * 12 + m);
+    const offset = (now.getUTCFullYear() * 12 + now.getUTCMonth() + 1) - (y * 12 + m);
     if (offset < 0 || offset > 1) {
       err('data.json',
         `dataStart ${data.dataStart} puts the current month at index ${offset} of starts[] — expected 0 or 1`);
@@ -328,10 +347,32 @@ async function checkGeocode(data) {
        absent flag as permission to move it would have this tool quietly undoing
        the one correction a person went to the trouble of making. It is still
        reported, because a manual pin 8 km from its own address is worth
-       knowing about — it is just not overwritten. */
+       knowing about — it is just not overwritten.
+
+       ── AND NOTHING REWRITES A PROVENANCE WE CANNOT READ ──────────────────
+       `manual` is not the only string that means "not yours to move"; it is
+       just the only one that exists today. A geoSource this file does not
+       recognise came from a tool written after it — a future confidence level,
+       an import from another division, a hand edit somebody labelled — and the
+       one thing we can say about it is that we do not know what it means. A
+       guard that only asks "is this the literal string manual?" reads every
+       such value as permission. So the check is: known value, or no value.
+
+       AN ABSENT geoSource IS NOT SUSPICIOUS, and it deliberately does not
+       trigger the above. Every one of the 71 pins on the map today is missing
+       the field, because the field postdates all of them — and so does the
+       manual-placement tooling that would have written "manual", which means
+       an absent geoSource cannot be concealing a hand placement. There were no
+       hand placements to conceal. Treating absent as protected would not close
+       a gap, it would switch --fix off for the entire division while this same
+       function went on printing "re-run with --fix to correct" at an operator
+       for whom that had silently become a no-op. Absent falls through to the
+       approxGeo rule, exactly as it always has.                              */
     const byHand = c.geoSource === 'manual';
+    // A non-empty value we have never heard of. Absent is not this.
+    const unreadable = !!c.geoSource && !KNOWN_GEO_SOURCES.has(c.geoSource);
     const confident = hit.precision === 'address' && d <= DRIFT_FIX_MAX_M
-                   && !c.approxGeo && !byHand;
+                   && !c.approxGeo && !byHand && !unreadable;
 
     if (FIX && confident) {
       fixes.push({ who: c.name, from: [c.lat, c.lon], to: [hit.lat, hit.lon], d });
@@ -342,9 +383,42 @@ async function checkGeocode(data) {
       warn(c.name, `${detail} — re-run with --fix to correct`);
     } else if (byHand) {
       warn(c.name, `${detail} — placed by hand, so it is reported but never moved`);
+    } else if (unreadable) {
+      /* Named in full, because the value IS the finding: whoever reads this
+         knows what wrote it and this file does not. There is no --force flag to
+         offer — forcing one pin would be another way to move a coordinate with
+         no record of who decided to. Either teach this file the value, or clear
+         the pin and let --fix place it afresh. */
+      warn(c.name, `${detail} — geoSource "${c.geoSource}" is not a provenance this `
+        + `tool recognises, so it is reported but never moved. Add it to `
+        + `AUTO_GEO_SOURCES in tools/validate.js if it is one of ours, or clear this `
+        + `community's lat/lon to let --fix place it again`);
     } else {
       warn(c.name, `${detail} — needs a human`);
     }
+  }
+}
+
+/* ── writing ──────────────────────────────────────────────────────────────────
+   Write beside the target, then rename over it. writeFileSync truncates the
+   file and then fills it, so an interruption in between — a full disk, a
+   Ctrl-C, a geocoder call that took long enough for somebody to give up — does
+   not leave a bad coordinate in data.json, it leaves no data.json worth
+   parsing. The map falls back to the database and the next run cannot read what
+   it is meant to be checking.
+
+   A rename within one directory is atomic on every filesystem this runs on:
+   every reader sees either the whole old document or the whole new one. Same
+   directory is not incidental — a rename across devices is a copy, which is
+   exactly the operation being avoided.                                        */
+function writeJsonAtomic(file, value) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(value));
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* already gone, or never written */ }
+    throw e;
   }
 }
 
@@ -372,7 +446,7 @@ async function checkGeocode(data) {
   }
 
   if (placements.length || fixes.length) {
-    fs.writeFileSync(DATA, JSON.stringify(data));
+    writeJsonAtomic(DATA, data);
   }
 
   if (placements.length) {

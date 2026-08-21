@@ -323,6 +323,76 @@ test('--fix never moves a hand-placed coordinate', () => {
    therefore refused to place ANY new community, including one whose address a
    human had typed in — while its own output told you to run it for exactly that. */
 
+/* ── WHOSE COORDINATE IS IT ──────────────────────────────────────────────────
+   The guard reads `geoSource` to decide whether --fix may move a pin, and the
+   distinction that matters is between a value it does not RECOGNISE and no value
+   at all. Those look alike and mean opposite things.
+
+   An unrecognised value means somebody or something recorded a provenance this
+   tooling does not understand — leave it alone. ABSENT means the community
+   predates the field, which is true of every one of the 74 in the division
+   today. Treating absent as unknown switched --fix off for the entire dataset
+   while the report went on telling you to re-run with --fix, which is a silent
+   feature-off dressed as caution. That is what these five pin down. */
+
+test('--fix leaves a coordinate whose provenance it cannot read', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].geoSource = 'imported-from-somewhere';
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const before = coordsOf(fx);
+
+  const r = run(fx, ['--fix'], { GEOCODE_CASE: 'confident-drift' });
+  assert(coordsOf(fx)[0] === before[0], 'an unrecognised geoSource must not move');
+  assert(/imported-from-somewhere/.test(r.out),
+    `and the value should be named so it can be investigated:
+${r.out}`);
+});
+
+test('but a coordinate with NO provenance is still corrected', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  delete d.communities[0].geoSource;
+  delete d.communities[0].approxGeo;
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const before = coordsOf(fx);
+
+  const r = run(fx, ['--fix'], { GEOCODE_CASE: 'confident-drift' });
+  assert(/corrected 1 coordinate/.test(r.out),
+    `absent is not unknown — every community predates the field:
+${r.out}`);
+  assert(coordsOf(fx)[0] !== before[0], 'and the coordinate actually moved');
+});
+
+test('an automatic provenance is movable, when nothing else blocks it', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].geoSource = 'agreement';
+  delete d.communities[0].approxGeo;      // map-core sets this alongside; see below
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+
+  const r = run(fx, ['--fix'], { GEOCODE_CASE: 'confident-drift' });
+  assert(/corrected 1 coordinate/.test(r.out),
+    `a value this tooling writes is not itself a reason to refuse:
+${r.out}`);
+});
+
+test('approxGeo blocks the fix whatever the provenance says', () => {
+  const fx = tmpFixture();
+  const d = JSON.parse(fs.readFileSync(fx.dp));
+  d.communities[0].geoSource = 'agreement';
+  d.communities[0].approxGeo = true;
+  fs.writeFileSync(fx.dp, JSON.stringify(d));
+  const before = coordsOf(fx);
+
+  run(fx, ['--fix'], { GEOCODE_CASE: 'confident-drift' });
+  /* Worth being explicit about, because it is what makes the case above
+     largely theoretical: map-core sets approxGeo alongside every automatic
+     geoSource it writes, so in practice approxGeo is the operative gate and the
+     provenance check is the backstop rather than the other way round. */
+  assert(coordsOf(fx)[0] === before[0], 'approxGeo remains the operative gate');
+});
+
 test('--fix places a community that has an address but no coordinate', () => {
   const fx = tmpFixture();
   const d = JSON.parse(fs.readFileSync(fx.dp));
