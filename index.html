@@ -184,6 +184,11 @@
     box-shadow: 0 0 0 3px rgba(201,168,76,0.4), 0 1px 4px rgba(0,0,0,0.35);
     transform: scale(1.25);
   }
+  #division-row { display: flex; gap: 6px; margin-top: 6px; }
+  .div-dot {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    margin-right: 6px; vertical-align: -1px; border: 1px solid rgba(255,255,255,0.7);
+  }
   .office-pin {
     width: 18px; height: 18px;
     display: flex; align-items: center; justify-content: center;
@@ -690,7 +695,7 @@
   <img src="logo.svg" class="hdr-logo" alt=""/>
   <div class="logo-block">
     <div class="brand">LENNAR</div>
-    <div class="subtitle">Orlando Division — Community Map</div>
+    <div class="subtitle" id="hdr-subtitle">Orlando Division — Community Map</div>
   </div>
   <div class="divider"></div>
   <div class="meta">
@@ -719,6 +724,9 @@
         <button class="filter-btn" data-filter="active">Active</button>
         <button class="filter-btn" data-filter="next3">Next 3 mo</button>
         <button class="filter-btn export-btn" id="export-btn" title="Download the communities currently shown, as CSV">↓ CSV</button>
+      </div>
+      <div id="division-row" style="display:none">
+        <button class="filter-btn active" data-division="">All divisions</button>
       </div>
     </div>
     <div id="trade-filter-section">
@@ -828,7 +836,9 @@ const MAP_DB = {
   // rollback copies and the publisher's email address are not reachable from an
   // unauthenticated page.
   from: 'map_public',
-  row:  'orlando',
+  // Every division row this page shows, in display order. A division whose row
+  // does not exist yet is simply absent — the page renders whatever it finds.
+  rows: ['orlando', 'tampa'],
 
   // A hung request is worse than a failed one: without a deadline the map waits
   // on the network indefinitely and the fallback never runs.
@@ -884,6 +894,10 @@ let PEOPLE = {};
 let ACM_CONTACTS = {};
 let dataStart = null;
 let meta = {};
+// Divisions present in the loaded data ({key,label}); the chips and pin colours
+// only appear when there is more than one.
+let DIVS = [];
+const DIV_COLORS = { orlando: null, tampa: '#0d9488' };   // null = the default pin blue
 
 // Communities that arrived without usable coordinates. They are held out of
 // `communities` entirely rather than plotted, because every consumer downstream
@@ -910,16 +924,16 @@ function esc(s) {
 async function loadFromDb() {
   if (!MAP_DB.url || !MAP_DB.key) return null;
 
-  // Reads are cheap and the payload is ~100 KB, so ask for exactly the columns
-  // the page uses. vnd.pgrst.object+json makes PostgREST return the single row
-  // as an object and 406 if there isn't exactly one, which turns "no row yet"
-  // into an ordinary failure rather than an empty array to special-case.
+  // Reads are cheap and each payload is ~100 KB, so ask for exactly the columns
+  // the page uses. One request fetches every division row at once; a division
+  // whose row does not exist yet just is not in the answer.
   //
   // updated_by is deliberately not requested and not exposed by the view: it is a
   // staff email address, and this page is open to anyone.
+  const keys = MAP_DB.rows.map(encodeURIComponent).join(',');
   const url = `${MAP_DB.url}/rest/v1/${MAP_DB.from}`
-            + `?key=eq.${encodeURIComponent(MAP_DB.row)}`
-            + `&select=payload,people,updated_at`;
+            + `?key=in.(${keys})`
+            + `&select=key,label,payload,people,updated_at`;
 
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), MAP_DB.timeoutMs);
@@ -930,17 +944,18 @@ async function loadFromDb() {
       headers: {
         apikey: MAP_DB.key,
         Authorization: `Bearer ${MAP_DB.key}`,
-        Accept: 'application/vnd.pgrst.object+json'
+        Accept: 'application/json'
       }
     });
     if (!r.ok) return { error: `${MAP_DB.from}: HTTP ${r.status}` };
-    const row = await r.json();
-    if (!row || !row.payload) return { error: `${MAP_DB.from}: row has no payload` };
-    return {
-      data: row.payload,
-      people: row.people || { people: {} },
-      publishedAt: row.updated_at || null
-    };
+    const arr = await r.json();
+    const rows = (Array.isArray(arr) ? arr : [])
+      .filter(x => x && x.payload)
+      .sort((a, b) => MAP_DB.rows.indexOf(a.key) - MAP_DB.rows.indexOf(b.key))
+      .map(x => ({ key: x.key, label: x.label || x.key, data: x.payload,
+                   people: x.people || { people: {} }, publishedAt: x.updated_at || null }));
+    if (!rows.length) return { error: `${MAP_DB.from}: no rows with a payload` };
+    return { rows };
   } catch (err) {
     return { error: err && err.name === 'AbortError'
       ? `${MAP_DB.from}: no response within ${MAP_DB.timeoutMs} ms`
@@ -974,58 +989,80 @@ async function loadData() {
   let fellBackBecause = null;
   let publishedAt = null;
 
-  let got = await loadFromDb();
+  let rows;
+  const got = await loadFromDb();
   if (!got || got.error) {
     fellBackBecause = got && got.error ? got.error : 'database not configured';
     source = 'files';
-    got = await loadFromFiles();   // if this throws, init() reports it as fatal
+    const f = await loadFromFiles();   // if this throws, init() reports it as fatal
+    rows = [{ key: 'orlando', label: 'Orlando', data: f.data, people: f.people || { people: {} }, publishedAt: null }];
   } else {
-    publishedAt = got.publishedAt;
+    rows = got.rows;
+    publishedAt = rows.map(r => r.publishedAt).filter(Boolean).sort().pop() || null;
   }
 
-  const data = got.data;
-  const ppl  = got.people || { people: {} };
+  // One shared month window for every division: the LATEST dataStart wins, and a
+  // row published against an earlier window has its starts[] shifted into it, so
+  // Tampa's numbers line up under the same month labels as Orlando's.
+  dataStart = rows.map(r => r.data.dataStart).filter(Boolean).sort().pop();
+  const monthsBetween = (a, b) => { const [ay, am] = a.split('-').map(Number), [by, bm] = b.split('-').map(Number);
+    return (by * 12 + bm) - (ay * 12 + am); };
 
-  PEOPLE = ppl.people || {};
-  dataStart = data.dataStart;
   meta = {
-    generatedAt: data.generatedAt,
-    updateCadenceDays: data.updateCadenceDays || 7,
+    generatedAt: rows.map(r => r.data.generatedAt).filter(Boolean).sort().pop() || null,
+    updateCadenceDays: rows[0].data.updateCadenceDays || 7,
     source,
     fellBackBecause,
     publishedAt
   };
 
-  const cats = data.tradeCats || [];
-  const vendors = data.vendors || [];
+  PEOPLE = {}; ACM_CONTACTS = {};
+  DIVS = rows.map(r => ({ key: r.key, label: r.label || r.key }));
 
-  // Rehydrate to the shape the rest of the application already expects. The wire
-  // format is normalized; the in-memory format is unchanged, so nothing
-  // downstream had to be rewritten to suit it.
-  communities = (data.communities || []).map(c => {
-    const rec = Object.assign({}, c);
+  // Rehydrate each division against ITS OWN cats/vendors/people — the index
+  // spaces are per document — then merge. The in-memory community shape is
+  // unchanged apart from the added `division` tag, so nothing downstream had to
+  // be rewritten to suit it.
+  const all = [];
+  for (const row of rows) {
+    const data = row.data;
+    const ppl = (row.people && row.people.people) || {};
+    Object.assign(PEOPLE, ppl);
+    const cats = data.tradeCats || [];
+    const vendors = data.vendors || [];
+    const shift = data.dataStart ? Math.max(0, monthsBetween(data.dataStart, dataStart)) : 0;
 
-    if (c.trades) {
-      const t = {};
-      for (const [ci, vi] of Object.entries(c.trades)) {
-        const cat = cats[ci], ven = vendors[vi];
-        if (cat != null && ven != null) t[cat] = ven;
+    (data.communities || []).forEach(c => {
+      const rec = Object.assign({}, c);
+      rec.division = row.key;
+
+      if (shift > 0 && Array.isArray(rec.starts)) {
+        rec.starts = rec.starts.slice(shift).concat(new Array(Math.min(shift, 12)).fill(0)).slice(0, 12);
       }
-      rec.trades = t;
-    } else {
-      rec.trades = {};
-    }
 
-    rec.cms = (c.cms || []).map(id => PEOPLE[id]).filter(Boolean);
-    if (c.acm && PEOPLE[c.acm]) {
-      const p = PEOPLE[c.acm];
-      rec.acm = p.name;
-      ACM_CONTACTS[p.name] = { phone: p.phone, email: p.email };
-    } else {
-      rec.acm = null;
-    }
-    return rec;
-  });
+      if (c.trades) {
+        const t = {};
+        for (const [ci, vi] of Object.entries(c.trades)) {
+          const cat = cats[ci], ven = vendors[vi];
+          if (cat != null && ven != null) t[cat] = ven;
+        }
+        rec.trades = t;
+      } else {
+        rec.trades = {};
+      }
+
+      rec.cms = (c.cms || []).map(id => ppl[id]).filter(Boolean);
+      if (c.acm && ppl[c.acm]) {
+        const p = ppl[c.acm];
+        rec.acm = p.name;
+        ACM_CONTACTS[p.name] = { phone: p.phone, email: p.email };
+      } else {
+        rec.acm = null;
+      }
+      all.push(rec);
+    });
+  }
+  communities = all;
 
   // Split off anything that cannot be placed. 0,0 counts as unplaceable, not as a
   // location: it is what a null becomes after arithmetic, and it is in the Gulf of
@@ -1172,6 +1209,7 @@ let map, markers = [], groups = [], groupOf = [];
 let activeItem = null;
 let currentFilter = 'all';
 let currentSearch = '';
+let currentDivision = '';
 let currentTrade = '';
 let currentVendor = '';
 let vendorColorMap = {};
@@ -1245,6 +1283,9 @@ function metresBetween(a, b) {
 // Two communities belong on the same pin if they are the same development, or
 // simply close enough that separate pins would overlap.
 function sameGroup(a, b) {
+  // A pin never spans divisions: pin colour is per division, and two same-named
+  // developments in different divisions are different developments.
+  if (a.division !== b.division) return false;
   const d = metresBetween(a, b);
   /* An empty development name is not a match. developmentOf() strips trailing
      designators and phase digits, so a community the sheets know only by its
@@ -1315,6 +1356,16 @@ function groupNext3(g) {
   return visibleMembers(g).reduce((a, i) => a + next3Total(communities[i]), 0);
 }
 
+// With no trade filter active, pins are coloured by division (Orlando keeps the
+// default blue; other divisions get their own colour). A group never mixes
+// divisions — sameGroup() guarantees that — so any member answers for the pin.
+function divisionColor(g) {
+  if (DIVS.length < 2) return null;
+  const m = groups[g].members[0];
+  const c = communities[m];
+  return (c && DIV_COLORS[c.division]) || null;
+}
+
 function getMarkerColor(idx) {
   if (!currentTrade || currentVendor) return null;
   const c = communities[idx];
@@ -1327,7 +1378,7 @@ function getMarkerColor(idx) {
 // where the volume actually is.
 function groupColor(g) {
   const vis = visibleMembers(g);
-  if (!vis.length || !currentTrade || currentVendor) return null;
+  if (!vis.length || !currentTrade || currentVendor) return divisionColor(g);
   let best = null, bestStarts = -1;
   for (const i of vis) {
     const s = fyTotal(communities[i]);
@@ -1677,10 +1728,12 @@ function selectFromHash() {
   // community with no remaining starts is hidden. Clear the filters rather than
   // hand the recipient an empty map.
   if (!lastFiltered.some(f => f.idx === idx)) {
-    currentFilter = 'all'; currentSearch = ''; currentTrade = ''; currentVendor = '';
+    currentFilter = 'all'; currentSearch = ''; currentTrade = ''; currentVendor = ''; currentDivision = '';
     document.getElementById('search').value = '';
     document.querySelectorAll('.filter-btn[data-filter]').forEach(b =>
       b.classList.toggle('active', b.dataset.filter === 'all'));
+    document.querySelectorAll('.filter-btn[data-division]').forEach(b =>
+      b.classList.toggle('active', b.dataset.division === ''));
     // The dropdowns have to be reset too, not just the state behind them.
     // Leaving them populated shows an active trade filter that is not applied,
     // and the vendor select becomes a dead control — its handler sets a value
@@ -1765,6 +1818,10 @@ function applyFilters(opts = {}) {
     filtered = filtered.filter(({c, idx}) => next3Total(c) > 0 || force.includes(idx));
   }
 
+  if (currentDivision) {
+    filtered = filtered.filter(({c, idx}) => force.includes(idx) || c.division === currentDivision);
+  }
+
   if (currentSearch) {
     const q = currentSearch.toLowerCase();
     filtered = filtered.filter(({c, idx}) =>
@@ -1826,6 +1883,7 @@ function applyFilters(opts = {}) {
 function exportCSV() {
   const cols = ['Community','Community #','Address','City','Municipality','Electric','Water',
                 'Area Manager','12-mo Starts','Next 3 mo','Latitude','Longitude','Approx. location'];
+  if (DIVS.length > 1) cols.unshift('Division');
   if (currentTrade) cols.push('Trade', 'Vendor');
 
   // Quoting keeps the CSV well-formed; the leading apostrophe keeps Excel from
@@ -1845,6 +1903,7 @@ function exportCSV() {
     const r = [c.name, c.num, c.addr, cityFromAddr(c.addr), c.municipality || '', c.electric || '',
                c.water || '', c.acm || '', c.unforecasted ? 'not forecasted' : fyTotal(c),
                next3Total(c), c.lat, c.lon, c.approxGeo ? 'yes' : ''];
+    if (DIVS.length > 1) r.unshift((DIVS.find(d => d.key === c.division) || {}).label || c.division || '');
     if (currentTrade) r.push(currentTrade, (c.trades && c.trades[currentTrade]) || '');
     return r.map(cell).join(',');
   });
@@ -1893,6 +1952,28 @@ function wireControls() {
       applyFilters();
     });
   });
+
+  // Division chips: rendered only when the data actually spans divisions.
+  const divRow = document.getElementById('division-row');
+  if (divRow && DIVS.length > 1) {
+    divRow.style.display = '';
+    DIVS.forEach(d => {
+      const b = document.createElement('button');
+      b.className = 'filter-btn';
+      b.dataset.division = d.key;
+      const sw = DIV_COLORS[d.key] || '#2563EB';
+      b.innerHTML = `<span class="div-dot" style="background:${sw}"></span>${esc(d.label)}`;
+      divRow.appendChild(b);
+    });
+    divRow.querySelectorAll('.filter-btn[data-division]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        divRow.querySelectorAll('.filter-btn[data-division]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentDivision = btn.dataset.division;
+        applyFilters();
+      });
+    });
+  }
 
   document.getElementById('search').addEventListener('input', e => {
     currentSearch = e.target.value.trim();
@@ -2046,12 +2127,28 @@ function fatal(msg, detail) {
   document.getElementById('hdr-count').textContent  = communities.length;
   document.getElementById('hdr-window').textContent = windowLabel();
 
+  // Header names whichever divisions actually loaded.
+  const sub = document.getElementById('hdr-subtitle');
+  if (sub && DIVS.length) {
+    sub.textContent = (DIVS.length === 1
+      ? `${DIVS[0].label} Division`
+      : DIVS.map(d => d.label).join(' & ') + ' Divisions') + ' — Community Map';
+  }
+
   initMap();
   buildGroups();
   buildMarkers();
   addOfficePin();
   wireControls();
   applyFilters();
+
+  // With more than one division the hardcoded Orlando center no longer frames
+  // the data — fit the view to every pin instead. Feature-checked so a partial
+  // Leaflet (the test harness stubs it) degrades to the default view.
+  if (DIVS.length > 1 && groups.length && typeof L.latLngBounds === 'function' && map.fitBounds) {
+    map.fitBounds(L.latLngBounds(groups.map(g => [g.lat, g.lon])), { padding: [40, 40] });
+  }
+
   selectFromHash();
 })();
 </script>

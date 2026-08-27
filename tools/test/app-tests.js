@@ -166,6 +166,16 @@ async function boot(opts = {}) {
       });
     }
 
+    // The page now asks for every division row in one request and gets an
+    // array back. The fixture stays a single Orlando object so every existing
+    // dbMutate caller keeps working; it is wrapped at serve time, and a row
+    // whose payload was nulled out simply yields an empty usable set.
+    if (name === 'map_public' && files[name]) {
+      const rows = [Object.assign({ key: 'orlando', label: 'Orlando' }, files[name])];
+      if (opts.dbExtraRows) rows.push(...opts.dbExtraRows(files));
+      return Promise.resolve({ ok: true, status: 200,
+        json: () => Promise.resolve(rows) });
+    }
     if (files[name]) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(files[name]) });
     return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
   };
@@ -184,7 +194,7 @@ async function boot(opts = {}) {
     ;window.__state = () => ({
       communities, groups, markers, popupSelection, lastFiltered,
       currentFilter, currentSearch, currentTrade, currentVendor, activeItem,
-      months, next3Idx, dataStart, meta, unlocated
+      months, next3Idx, dataStart, meta, unlocated, DIVS, currentDivision
     });`);
 
   // Let the async init() settle. Tests that expect zero placeable communities
@@ -650,13 +660,45 @@ async function boot(opts = {}) {
     const w = await boot();
     const call = w.__requested.find(u => /\/rest\/v1\//.test(u));
     const select = decodeURIComponent((call.match(/select=([^&]+)/) || [])[1] || '');
-    eq(select.split(',').sort().join(','), 'payload,people,updated_at',
-       'the select list should be exactly the three columns the page uses');
+    eq(select.split(',').sort().join(','), 'key,label,payload,people,updated_at',
+       'the select list should be exactly the columns the page uses — the row key and label name the division');
     // updated_by is a staff email address. It has no place on a page with no
     // sign-in, and the view does not expose it either.
     assert(!/updated_by/.test(call), 'updated_by must not be requested');
     assert(!/prev_payload|prev_people/.test(call),
            'the rollback copies must not be requested');
+  });
+
+  await test('a second division row merges in — tagged, chipped, coloured and filterable', async () => {
+    const w = await boot({ dbExtraRows: files => [{
+      key: 'tampa', label: 'Tampa',
+      payload: { generatedAt: files['data.json'].generatedAt, updateCadenceDays: 7,
+                 dataStart: files['data.json'].dataStart, tradeCats: [], vendors: [],
+                 communities: [{ name: 'Tarpon Bay', num: '9991230000', addr: 'Tampa, FL 33619',
+                                 lat: 27.95, lon: -82.30, starts: [2,1,0,0,0,0,0,0,0,0,0,0] }] },
+      people: { people: {} }, updated_at: new Date().toISOString()
+    }] });
+    eq(S(w).communities.length, 72, 'both divisions load onto one map');
+    const tb = S(w).communities.find(c => c.name === 'Tarpon Bay');
+    assert(tb && tb.division === 'tampa', 'the Tampa community carries its division');
+    assert(S(w).communities.every(c => c.name === 'Tarpon Bay' || c.division === 'orlando'),
+           'and every Orlando community carries its own');
+    const row = w.document.getElementById('division-row');
+    assert(row && row.style.display !== 'none', 'the division chips appear');
+    eq(row.querySelectorAll('.filter-btn').length, 3, 'All divisions + one chip per division');
+    assert(/Orlando & Tampa/.test(w.document.getElementById('hdr-subtitle').textContent),
+           'the header names both divisions');
+    // The Tampa chip narrows the map to that division.
+    row.querySelector(".filter-btn[data-division='tampa']").click();
+    eq(S(w).lastFiltered.length, 1, 'the Tampa chip narrows the list to Tampa');
+    eq(S(w).lastFiltered[0].c.name, 'Tarpon Bay', 'to exactly the Tampa community');
+    row.querySelector(".filter-btn[data-division='']").click();
+    assert(S(w).lastFiltered.length > 1, 'and All divisions restores the rest');
+    // With no trade filter, the Tampa pin is coloured by division.
+    const g = S(w).groups.findIndex(grp => grp.members.some(i => S(w).communities[i].name === 'Tarpon Bay'));
+    assert(g >= 0, 'the Tampa community has a pin');
+    assert(!S(w).groups[g].members.some(i => S(w).communities[i].division !== 'tampa'),
+           'and its pin never mixes divisions');
   });
 
   await test('no other table in the shared database is ever contacted', async () => {
