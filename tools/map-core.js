@@ -1377,7 +1377,12 @@
   }
 
   function buildDocument(input) {
-    const find = { notes: input.notes || [], problems: input.problems || [] };
+    /* warnings is an OPTIONAL third channel. A caller that supplies it (Blueprint)
+       gets the advisory findings separated from the blocking ones; a caller that
+       does not (the CLI, older harnesses) gets them on problems exactly as
+       before, where they print but block nothing. */
+    const find = { notes: input.notes || [], problems: input.problems || [],
+                   warnings: input.warnings || null };
     const data = input.data;
     const people = JSON.parse(JSON.stringify(input.people || { people: {} }));
     const dataStart = input.dataStart || currentDataStart(input.now);
@@ -1398,10 +1403,21 @@
       for (const [id, p] of Object.entries(people.people || {})) {
         if (p.name) acmByName.set(p.name, id);
       }
+      /* An unknown manager is advisory, not blocking. It used to block, which
+         deadlocked a first publish: the people directory is created BY the
+         publish, so on a bootstrap every name is unknown and there is nowhere
+         the details could have been added yet. And blocking never protected
+         anything — dropping the contact sheet entirely was allowed with a mere
+         warning, so the strict path only ever forced a worse workaround. What
+         actually happens without the details: communities matched to that
+         manager publish without a manager card, and a later import fills it in
+         once the person is on file. */
       for (const n of contacts.acmNames) {
         if (!acmByName.has(n)) {
-          find.problems.push(`the contact sheet names an area manager we have no details for: "${n}"`
-            + " — add them to people.json (name, phone, email) and re-run");
+          (find.warnings || find.problems).push(
+            `the contact sheet names an area manager we have no details for: "${n}"`
+            + " — their communities publish without a manager card; add the person "
+            + "(name, phone, email) to the people directory and re-import to fill it in");
         }
       }
       contacts.acmId = n => acmByName.get(n) || null;
@@ -1603,6 +1619,7 @@
       people,
       notes: find.notes,
       problems: find.problems,
+      warnings: find.warnings || [],
       added, dormant, needGeo, droppedPeople,
       coverage,
       totals: {
