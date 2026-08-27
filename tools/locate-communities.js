@@ -19,15 +19,40 @@
  *                     `manual`, which means nothing ever moves it again.
  *
  *   --no-cis      skip the Community-DB lookup entirely
- *   --division    which division's sheets to read (default orlando)
+ *   --division    which division's sheets to read (default orlando, or the
+ *                 --db row name when that is given)
  *
  * SUPABASE_KEY in the environment enables the Community-DB cross-reference,
  * which supplies each community's city and postcode. Optional: without it the
  * run works exactly as before, just with less to go on.
  *
- * Run after import-workbooks.js and before seed-supabase.js. Safe to re-run: a
- * community already located is skipped, and a community that cannot be resolved
- * is left exactly as it was with a note about what was tried.
+ * ── DATABASE MODE ────────────────────────────────────────────────────────────
+ *
+ *   SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/locate-communities.js \
+ *     --db tampa --starts "TPU Start Log.xlsx"
+ *
+ *   --db ROW      operate on the map_data row named ROW instead of a local
+ *                 data.json. The document is fetched, located exactly as below,
+ *                 and written back with the previous version preserved in the
+ *                 prev_* columns — the same rollback contract Blueprint's
+ *                 publish keeps, so the Vendor Assignments rollback still works
+ *                 after a locate run. A history line lands in map_change_log.
+ *
+ *   This exists because a division bootstrapped from Blueprint (Tampa) has no
+ *   data.json anywhere — its document lives only in the table. File mode cannot
+ *   locate what it cannot open. In db mode there is no seed-supabase step: the
+ *   write IS the publish. --place works through it too:
+ *
+ *     SUPABASE_KEY=… node tools/locate-communities.js --db tampa \
+ *       --only "Ballentine Park" --place "28.03,-82.24"
+ *
+ *   The service role key is REQUIRED in db mode (map_data is not anon-writable),
+ *   and the same host validation applies before it is sent anywhere.
+ *
+ * Run after import-workbooks.js and before seed-supabase.js (file mode). Safe
+ * to re-run: a community already located is skipped, and a community that
+ * cannot be resolved is left exactly as it was with a note about what was
+ * tried.
  *
  * ── WHAT THIS DOES AND DOES NOT DECIDE ───────────────────────────────────────
  * It asks a geocoder where each of a community's streets is, and hands the
@@ -115,8 +140,99 @@ function hostAllowed(u) {
   return ok.indexOf(h) !== -1;
 }
 const KEY      = argOf('--key', process.env.SUPABASE_KEY || '');
-const DIVISION = argOf('--division', 'orlando');
+const DB_ROW   = argOf('--db', null);
+/* In db mode the row IS the division — asking for --db tampa and defaulting
+   the Community-DB lookup to orlando would cross-reference the wrong sheets
+   silently. Saying --division explicitly still wins, for the odd case where a
+   row and its CIS division are named differently. */
+const DIVISION = argOf('--division', DB_ROW || 'orlando');
 const NO_CIS   = has('--no-cis');
+
+/* ── database mode ────────────────────────────────────────────────────────────
+   The document a Blueprint bootstrap creates exists only in map_data — there is
+   no data.json to read or write. These two functions replace the file at both
+   ends of the run: same locate loop in the middle, untouched.
+
+   The save deliberately mirrors Blueprint's DB.mapPublish, NOT seed-supabase:
+   prev_payload / prev_people / prev_updated_at / prev_by are set from the row
+   as it was fetched, because those columns are the only way back and the
+   rollback panel reads them. seed-supabase skips them because a seed is not a
+   publish; a locate run over live data IS one. `people` is not sent at all —
+   merge-duplicates leaves unsent columns alone, and this tool has no business
+   rewriting contacts. */
+function dbRequireKey() {
+  if (!KEY) {
+    console.error('--db needs SUPABASE_KEY=<SERVICE_ROLE_KEY> in the environment —');
+    console.error('map_data is not anon-writable, so there is no lesser key that works.');
+    process.exit(2);
+  }
+  if (!hostAllowed(URL_BASE)) {
+    console.error(`refusing to send the key to ${URL_BASE} — not the project host.`);
+    console.error('Set SUPABASE_ALLOWED_HOSTS if that is deliberate.');
+    process.exit(2);
+  }
+}
+function dbHeaders(extra) {
+  return Object.assign({
+    apikey: KEY, Authorization: `Bearer ${KEY}`, Accept: 'application/json'
+  }, extra || {});
+}
+async function dbFetchRow() {
+  const url = `${URL_BASE}/rest/v1/map_data`
+    + `?key=eq.${encodeURIComponent(DB_ROW)}`
+    + '&select=key,label,payload,people,updated_at,updated_by';
+  const res = await fetch(url, { headers: dbHeaders() });
+  if (!res.ok) throw new Error(`map_data returned HTTP ${res.status} fetching row "${DB_ROW}"`);
+  const rows = await res.json();
+  if (!rows.length || !rows[0].payload) {
+    throw new Error(`no map_data row "${DB_ROW}" with a document — `
+      + 'publish the division from Blueprint first, then locate.');
+  }
+  return rows[0];
+}
+async function dbSaveRow(row, data, summary) {
+  const actor = 'locate-communities.js'
+    + (process.env.USERNAME ? ` (${process.env.USERNAME})` : '');
+  const res = await fetch(`${URL_BASE}/rest/v1/map_data?on_conflict=key`, {
+    method: 'POST',
+    headers: dbHeaders({
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=merge-duplicates,return=representation'
+    }),
+    body: JSON.stringify([{
+      key: row.key,
+      payload: data,
+      updated_at: new Date().toISOString(),
+      updated_by: actor,
+      prev_payload: row.payload,
+      prev_people: row.people || null,
+      prev_updated_at: row.updated_at || null,
+      prev_by: row.updated_by || null
+    }])
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(`map_data write failed: HTTP ${res.status} ${detail.slice(0, 300)}`);
+  }
+  const out = await res.json();
+  if (!Array.isArray(out) || !out.length) {
+    throw new Error('the write came back empty — row-level security filtered it. '
+      + 'Is SUPABASE_KEY the service role key, not the anon key?');
+  }
+  /* Best-effort, exactly as Blueprint treats it: the data is written either
+     way, and failing the run because the history line did not land would be
+     the worse outcome. */
+  let history = true;
+  try {
+    const lr = await fetch(`${URL_BASE}/rest/v1/map_change_log`, {
+      method: 'POST',
+      headers: dbHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify([{ key: row.key, actor, summary }])
+    });
+    history = lr.ok;
+  } catch { history = false; }
+  return { history };
+}
 
 /* Placing one by hand does not need the starts log, a geocoder or a network, so
    it is handled before any of that is required. Blueprint is the normal route;
@@ -124,32 +240,56 @@ const NO_CIS   = has('--no-cis');
    does not, and without it the fallback cannot place anything at all —
    validate.js --fix needs an address, and these communities have none. */
 if (PLACE) {
-  if (ONLY.length !== 1) {
-    console.error('--place needs exactly one --only "<community name>"');
-    process.exit(2);
-  }
-  const pt = CORE.parseLatLon(PLACE);
-  if (!pt) {
-    console.error(`could not read "${PLACE}" as a coordinate — try "28.6607,-81.5458"`);
-    process.exit(2);
-  }
-  const data = JSON.parse(fs.readFileSync(DATA, 'utf8'));
-  const rec = data.communities.find(c =>
-    String(c.name).toLowerCase() === ONLY[0].toLowerCase());
-  if (!rec) {
-    console.error(`no community named "${ONLY[0]}" — check the spelling against data.json`);
-    process.exit(2);
-  }
-  const r = CORE.placeManually(rec, pt.lat, pt.lon, { by: process.env.USERNAME || null });
-  if (!r.ok) { console.error('  refused: ' + r.error); process.exit(1); }
-  if (DRY) {
-    console.log(`\n  --dry-run: would place ${rec.name} at ${r.lat},${r.lon}\n`);
-  } else {
-    writeJsonAtomic(DATA, data);
-    console.log(`\n  placed ${rec.name} at ${r.lat},${r.lon} (manual — never auto-corrected)`);
-    console.log('  next:  SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js\n');
-  }
-  process.exit(0);
+  (async () => {
+    if (ONLY.length !== 1) {
+      console.error('--place needs exactly one --only "<community name>"');
+      process.exit(2);
+    }
+    const pt = CORE.parseLatLon(PLACE);
+    if (!pt) {
+      console.error(`could not read "${PLACE}" as a coordinate — try "28.6607,-81.5458"`);
+      process.exit(2);
+    }
+    let row = null, data;
+    if (DB_ROW) {
+      dbRequireKey();
+      row = await dbFetchRow();
+      data = row.payload;
+    } else {
+      data = JSON.parse(fs.readFileSync(DATA, 'utf8'));
+    }
+    const rec = data.communities.find(c =>
+      String(c.name).toLowerCase() === ONLY[0].toLowerCase());
+    if (!rec) {
+      console.error(`no community named "${ONLY[0]}" — check the spelling against `
+        + (DB_ROW ? `the "${DB_ROW}" document` : 'data.json'));
+      process.exit(2);
+    }
+    const r = CORE.placeManually(rec, pt.lat, pt.lon, { by: process.env.USERNAME || null });
+    if (!r.ok) { console.error('  refused: ' + r.error); process.exit(1); }
+    if (DRY) {
+      console.log(`\n  --dry-run: would place ${rec.name} at ${r.lat},${r.lon}\n`);
+    } else if (DB_ROW) {
+      const w = await dbSaveRow(row, data,
+        `Manually placed ${rec.name} at ${r.lat},${r.lon} (locate-communities.js --place)`);
+      console.log(`\n  placed ${rec.name} at ${r.lat},${r.lon} (manual — never auto-corrected)`);
+      console.log(`  written to map_data row "${DB_ROW}" — the map is already showing it.`
+        + (w.history ? '' : ' (history line did not land)'));
+      console.log('');
+    } else {
+      writeJsonAtomic(DATA, data);
+      console.log(`\n  placed ${rec.name} at ${r.lat},${r.lon} (manual — never auto-corrected)`);
+      console.log('  next:  SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js\n');
+    }
+    /* No process.exit(0) here: the module returns right after this block, and
+       exiting mid-close trips the Windows libuv assertion noted below. */
+  })().catch(e => {
+    console.error('\n  failed: ' + ((e && e.message) || e) + '\n');
+    /* exitCode rather than exit(): on Windows, exit() during a closing network
+       handle trips a libuv assertion that reads like a second, scarier error. */
+    process.exitCode = 1;
+  });
+  return;
 }
 
 if (!XLSX) {
@@ -272,7 +412,16 @@ async function fetchLocalities() {
 /* ── run ──────────────────────────────────────────────────────────────────── */
 
 (async function main() {
-  const data = JSON.parse(fs.readFileSync(DATA, 'utf8'));
+  let row = null, data;
+  if (DB_ROW) {
+    dbRequireKey();
+    row = await dbFetchRow();
+    data = row.payload;
+    console.log(`\n  map_data row "${row.key}" (${row.label || DB_ROW}), `
+      + `last published ${row.updated_at || 'unknown'} by ${row.updated_by || 'unknown'}`);
+  } else {
+    data = JSON.parse(fs.readFileSync(DATA, 'utf8'));
+  }
 
   const wb = XLSX.read(fs.readFileSync(STARTS), { type: 'buffer' });
   const sheet = startsSheet(wb);
@@ -412,15 +561,32 @@ async function fetchLocalities() {
   /* Attempt records are written even when nothing was placed. That is the point
      of keeping them: the next run knows what has already been tried, and the UI
      can explain a pending community without re-deriving it. */
-  writeJsonAtomic(DATA, data);
-  console.log(`\n  wrote ${path.relative(process.cwd(), DATA)}`
-    + (wrote ? '' : ' (attempt records only — no coordinates changed)'));
-  if (wrote) {
-    console.log('  next:  node tools/validate.js');
-    console.log('  then:  SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js');
+  if (DB_ROW) {
+    const summary = wrote
+      ? `Located ${applied.length} communit${applied.length === 1 ? 'y' : 'ies'}: `
+        + applied.map(a => a.name).join(', ') + ' (locate-communities.js)'
+      : 'Location attempt records updated — no coordinates changed (locate-communities.js)';
+    const w = await dbSaveRow(row, data, summary);
+    console.log(`\n  wrote map_data row "${DB_ROW}"`
+      + (wrote ? '' : ' (attempt records only — no coordinates changed)')
+      + (w.history ? '' : '  — history line did not land'));
+    if (wrote) {
+      console.log('  no seed step in db mode — the map is already showing the new pins.');
+      console.log('  the previous version is kept in prev_*; Blueprint can roll it back.');
+    }
+  } else {
+    writeJsonAtomic(DATA, data);
+    console.log(`\n  wrote ${path.relative(process.cwd(), DATA)}`
+      + (wrote ? '' : ' (attempt records only — no coordinates changed)'));
+    if (wrote) {
+      console.log('  next:  node tools/validate.js');
+      console.log('  then:  SUPABASE_KEY=<SERVICE_ROLE_KEY> node tools/seed-supabase.js');
+    }
   }
   console.log('');
 })().catch(e => {
-  console.error('\n  failed: ' + ((e && e.stack) || e) + '\n');
-  process.exit(1);
+  console.error('\n  failed: ' + ((e && e.message) || e) + '\n');
+  /* exitCode rather than exit(): on Windows, exit() during a closing network
+     handle trips a libuv assertion that reads like a second, scarier error. */
+  process.exitCode = 1;
 });
