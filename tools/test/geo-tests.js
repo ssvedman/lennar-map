@@ -305,6 +305,39 @@ group('developmentOf is the SAME rule index.html groups pins by');
     eq(C.developmentOf('40521'), '', 'in both files');
     ok(/if \(dev && dev === developmentOf\(b\.name\)\)/.test(html),
        'and index.html refuses to match on an empty development name');
+
+    /* TAMPA. Its product words are not Orlando's, and the day the division went
+       on the map every one of them read as part of the development name. The
+       live symptom, kept here as the example because it is what someone
+       actually saw: NPC drew three pins a few hundred metres apart — the AA
+       phases on one, "NPC 18TH SER" alone, "NPC 40 EVE" alone.
+
+       The truncated pair matters as much and is easier to overlook: the source
+       field is 15 characters, so CLA and PAR arrive as CL and PA on any name
+       long enough to reach the cut. */
+    const oneDev = (label, names) => {
+      const devs = [...new Set(names.map(theirs))];
+      eq(devs.length, 1, label + ' is one development, not ' + devs.length +
+         ' (' + devs.join(', ') + ')');
+    };
+    oneDev('NPC', ['NPC 40', 'NPC AA 50', 'NPC 18TH SER', 'NPC 40 EVE', 'NPC AA 60 CLA']);
+    oneDev('Acacia', ['Acacia 40', 'Acacia 18 SER', 'Acacia 40 COT', 'Acacia 50 CLA']);
+    oneDev('Conner', ['Conner 50 CLA', 'Conner 50 PIN', 'Conner 60 PAR', 'Conner 60 PIN']);
+    oneDev('Prosper', ['Prosper 60', 'Prosper AA60 CL', 'Prosper 40 COT', 'Prosper TH']);
+    oneDev('Stonegate', ['Stonegate 65s', 'Stonegate 65 PA', 'Stonegate 55CLA']);
+    oneDev('Seaire', ['Seaire 50', 'Seaire P3 40', 'Seaire 40 COT']);
+    oneDev('West Lake', ['West Lake 40', 'West Lake RLTH']);
+    oneDev('Epperson', ['Epperson 20 ASC', 'Epperson 20']);
+    oneDev('Angeline', ['Angeline 50', 'Angeline 50 T2', 'Angeline AA 27V']);
+    oneDev('Gulfshade', ['Gulfshade 50 MJ', 'Gulfshade 50']);
+
+    /* And the other direction, which is the risk of a longer list: a real word
+       that happens to sit at the end of a name must survive. "Hilltop Point" is
+       a development, not a Hilltop of type Point. */
+    eq(theirs('Hilltop Point'), 'hilltop point', 'a name ending in a real word is left alone');
+    eq(theirs('Balm East 50'), 'balm east', 'and a two-word development keeps both words');
+    ok(theirs('Conner 50 CLA') !== theirs('Connerton 40'),
+       'Conner and Connerton stay different developments');
   }
 }
 

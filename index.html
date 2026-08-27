@@ -876,11 +876,27 @@ const SAME_NAME_MAX_M = 25000;
 // distance fallback, which two phases laid out along a road routinely exceed —
 // and the map drew two pins almost on top of each other.
 //
+// Tampa arrived with a vocabulary of its own, and until it was added every one of
+// these words read as part of the development name: ASC, COT, SER, PIN, EVE and
+// MJ are Tampa's product series exactly as PAR and CLA are Orlando's. The visible
+// symptom was NPC — "NPC 40", "NPC AA 50", "NPC AA 60", "NPC AA 27V" and
+// "NPC AA 60 CLA" shared a pin while "NPC 18TH SER" and "NPC 40 EVE" each sat on
+// their own a few hundred metres away, one development drawn as three.
+//
+// CL, PA and RLTH are not series but TRUNCATIONS. The source field is 15
+// characters, so "Prosper AA60 CLA" is stored "Prosper AA60 CL" and
+// "Stonegate 65 PAR" as "Stonegate 65 PA" — the cut is in the data, will keep
+// happening, and a rule that only knows the untruncated spelling silently
+// strands whichever phase happened to be one character too long. The cut also
+// runs words together — "Prosper AA 60 CLA" becomes "Prosper AA60 CL" — which
+// is why each designator may carry digits. [a-z]\d+ covers
+// the phase markers that go the other way round to the numeric ones: T2, P3.
+//
 // This list MUST stay identical to map-core.js's. That file decides which
 // communities may vouch for each other's location and this one decides which
 // share a pin, and a divergence means the two disagree about what a development
 // is. A test compares them by behaviour over every real community name.
-const DESIGNATOR = /^(\d+[a-z]*|th|gc|aa|rl|fl|mjr|m|villa|classic|majors|sf|par|cla|vil|maj)$/i;
+const DESIGNATOR = /^(\d+[a-z]*|[a-z]\d+|(?:th|gc|aa|rl|fl|mjr|m|villa|classic|majors|sf|par|cla|vil|maj|asc|cot|ser|pin|eve|mj|cl|pa|rlth)\d*)$/i;
 
 function developmentOf(name) {
   const t = String(name).split(/\s+/);
@@ -1885,6 +1901,7 @@ function applyFilters(opts = {}) {
   lastFiltered = filtered;
   renderList(filtered);
   updateVendorColors();
+  syncOfficePins();
 }
 
 // ─────────────────────────────────────────────
@@ -2057,32 +2074,71 @@ function wireControls() {
   window.addEventListener('hashchange', selectFromHash);
 }
 
-function addOfficePin() {
+/* The division offices. Data rather than code since Tampa arrived: the pin, the
+   popup and the directions link were written out once per office by hand, which
+   is fine for one and is three places to forget for two.
+
+   `division` ties each to a map_data row key, so an office only appears when its
+   division actually loaded, and it hides with the division chips — a Tampa office
+   floating over an Orlando-filtered map is just a stray building. */
+const OFFICES = [
+  { division: 'orlando', name: 'Lennar Orlando Division Office',
+    addr: '6675 Westwood Blvd, Orlando, FL', floor: '5th Floor',
+    lat: 28.416139, lon: -81.472243 },
+  /* Census geocoded this one to the rooftop from the street address, so it is
+     exact rather than approximate like the community pins around it. */
+  { division: 'tampa', name: 'Lennar Tampa Division Office',
+    addr: '4301 W Boy Scout Blvd, Tampa, FL 33607', floor: null,
+    lat: 27.963381, lon: -82.515944 }
+];
+
+let officeMarkers = [];
+
+function addOfficePins() {
   const officeIcon = L.divIcon({
     className: '',
-    html: `<div class="office-pin">🏢</div>`,
+    html: `<div class="office-pin">\u{1F3E2}</div>`,
     iconSize:   [18, 18],
     iconAnchor: [9, 9],
     popupAnchor:[0, -12]
   });
 
-  L.marker([28.416139, -81.472243], { icon: officeIcon })
-    .addTo(map)
-    .bindPopup(`
+  const present = new Set(DIVS.map(d => d.key));
+  officeMarkers = OFFICES
+    .filter(o => !present.size || present.has(o.division))
+    .map(o => {
+      const m = L.marker([o.lat, o.lon], { icon: officeIcon })
+        .addTo(map)
+        .bindPopup(`
       <div class="popup-inner">
         <div class="popup-header">
-          <div class="popup-name">Lennar Orlando Division Office</div>
-          <div class="popup-addr">6675 Westwood Blvd, Orlando, FL</div>
-          <a class="gmaps-link" href="https://www.google.com/maps/dir/?api=1&destination=28.416139,-81.472243" target="_blank" rel="noopener">📍 Get Directions</a>
+          <div class="popup-name">${esc(o.name)}</div>
+          <div class="popup-addr">${esc(o.addr)}</div>
+          <a class="gmaps-link" href="https://www.google.com/maps/dir/?api=1&destination=${o.lat},${o.lon}" target="_blank" rel="noopener">\u{1F4CD} Get Directions</a>
         </div>
         <div class="popup-body">
           <div style="padding:10px 0; font-size:13px; color:#334155; line-height:1.6">
-            <strong>5th Floor</strong><br>
-            <span style="font-size:12px;color:#64748b">Lennar Homes Orlando Division Office</span>
+            ${o.floor ? '<strong>' + esc(o.floor) + '</strong><br>' : ''}
+            <span style="font-size:12px;color:#64748b">${esc(o.name)}</span>
           </div>
         </div>
       </div>
     `, { maxWidth: 320 });
+      m._division = o.division;
+      return m;
+    });
+}
+
+/* Called from applyFilters, so the offices follow the division chips. Nothing
+   else filters them: an office is not a community and has no trade, vendor or
+   start count to filter on. */
+function syncOfficePins() {
+  if (!officeMarkers.length || !map) return;
+  for (const m of officeMarkers) {
+    const show = !currentDivision || m._division === currentDivision;
+    if (show && !map.hasLayer(m)) m.addTo(map);
+    else if (!show && map.hasLayer(m)) map.removeLayer(m);
+  }
 }
 
 function fatal(msg, detail) {
@@ -2148,7 +2204,7 @@ function fatal(msg, detail) {
   initMap();
   buildGroups();
   buildMarkers();
-  addOfficePin();
+  addOfficePins();
   wireControls();
   applyFilters();
 

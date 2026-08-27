@@ -331,8 +331,14 @@
 
   /* Development name, for sibling matching: "Waterlin 40RL" and "Waterlin 50" are
      both Waterlin. The map's own index.html has the same rule for grouping pins;
-     a test asserts the two agree, since they must. */
-  const DESIGNATOR = /^(\d+[a-z]*|th|gc|aa|rl|fl|mjr|m|villa|classic|majors|sf|par|cla|vil|maj)$/i;
+     a test asserts the two agree, since they must.
+
+     Tampa's series words (ASC, COT, SER, PIN, EVE, MJ) sit alongside Orlando's,
+     and CL/PA/RLTH are what a 15-character source field leaves of CLA/PAR/RL TH.
+     Both matter here as much as they do to pin grouping: this rule also decides
+     which located phase may vouch for a sibling's coordinate, so a designator it
+     does not know is a corroboration that never gets offered. */
+  const DESIGNATOR = /^(\d+[a-z]*|[a-z]\d+|(?:th|gc|aa|rl|fl|mjr|m|villa|classic|majors|sf|par|cla|vil|maj|asc|cot|ser|pin|eve|mj|cl|pa|rlth)\d*)$/i;
   function developmentOf(name) {
     const t = String(name == null ? "" : name).split(/\s+/).filter(Boolean);
     while (t.length > 1 && DESIGNATOR.test(t[t.length - 1])) t.pop();

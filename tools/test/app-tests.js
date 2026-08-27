@@ -196,7 +196,8 @@ async function boot(opts = {}) {
     ;window.__state = () => ({
       communities, groups, markers, popupSelection, lastFiltered,
       currentFilter, currentSearch, currentTrade, currentVendor, activeItem,
-      months, next3Idx, dataStart, meta, unlocated, DIVS, currentDivision
+      months, next3Idx, dataStart, meta, unlocated, DIVS, currentDivision,
+      officeMarkers, OFFICES
     });`);
 
   // Let the async init() settle. Tests that expect zero placeable communities
@@ -233,6 +234,10 @@ async function boot(opts = {}) {
   const $ = s => doc.querySelector(s);
   const all = s => [...doc.querySelectorAll(s)];
   const S = (w = win) => w.__state();
+  /* The stub map's layer set — what is actually ON the map right now, as
+     opposed to what was constructed. Office pins are added and removed rather
+     than rebuilt, so this is the only way to see one hide. */
+  const L_LAYERS = (w = win) => w.L._layers;
   // Drive the real input rather than poking script-scope state, so the wiring
   // is exercised too.
   const search = q => {
@@ -949,6 +954,47 @@ async function boot(opts = {}) {
     const w = await boot();
     const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
     assert(/Lennar Orlando Division Office/.test(html), 'office pin title should be intact');
+  });
+
+  await test('an office only appears for a division that actually loaded', async () => {
+    const w = await boot();
+    const shown = S(w).officeMarkers;
+    eq(shown.length, 1, 'Orlando alone loaded, so one office pin');
+    eq(shown[0]._division, 'orlando', 'and it is the Orlando one');
+    assert(S(w).OFFICES.some(o => o.division === 'tampa'),
+           'Tampa is configured, just not drawn while its division is absent');
+  });
+
+  await test('two divisions draw two offices, and the chips hide the other one', async () => {
+    const w = await boot({ dbExtraRows: files => [{
+      key: 'tampa', label: 'Tampa',
+      payload: { generatedAt: files['data.json'].generatedAt, updateCadenceDays: 7,
+                 dataStart: files['data.json'].dataStart, tradeCats: [], vendors: [],
+                 communities: [{ name: 'Tarpon Bay', num: '9991230000', addr: 'Tampa, FL',
+                                 lat: 27.95, lon: -82.30, starts: [2,1,0,0,0,0,0,0,0,0,0,0] }] },
+      people: { people: {} }, updated_at: new Date().toISOString()
+    }] });
+
+    const offices = S(w).officeMarkers;
+    eq(offices.length, 2, 'both division offices are on the map');
+    const tampa = offices.find(o => o._division === 'tampa');
+    assert(tampa, 'including Tampa');
+    /* Boy Scout Blvd, Westshore. Asserted loosely — the point is that it is in
+       Tampa rather than left at Orlando's coordinate, which is the mistake a
+       copied block invites. */
+    assert(tampa._latlng[0] > 27.9 && tampa._latlng[0] < 28.0
+        && tampa._latlng[1] < -82.4 && tampa._latlng[1] > -82.6,
+           'at a Tampa coordinate, not a copy of Orlando\'s: ' + tampa._latlng);
+
+    /* An office is not a community, so nothing else filters it — but a Tampa
+       office floating over an Orlando-filtered map is just a stray building. */
+    const row = w.document.getElementById('division-row');
+    row.querySelector("[data-division='orlando']").click();
+    assert(!L_LAYERS(w).has(tampa), 'filtering to Orlando takes the Tampa office off');
+    assert(L_LAYERS(w).has(offices.find(o => o._division === 'orlando')),
+           'and leaves Orlando\'s');
+    row.querySelector("[data-division='']").click();
+    assert(L_LAYERS(w).has(tampa), 'All divisions brings it back');
   });
 
   console.log(`\n  ${pass} passed, ${fail} failed\n`);
