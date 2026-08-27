@@ -1226,10 +1226,20 @@ function initMap() {
 
   map = L.map('map', { center:[28.35,-81.55], zoom:9, zoomControl:true });
 
-  const cartoLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
-    subdomains: 'abcd', maxZoom: 19
+  /* The light basemap was CARTO's light_all, until CARTO started requiring an
+     API key for anonymous basemap use — tiles came back stamped "API KEY
+     REQUIRED". Esri's Light Gray Canvas is the same minimal style, needs no
+     key, and comes from the host the satellite layer already proved works.
+     Its base layer carries no labels, so the matching Reference layer rides on
+     top; native tiles stop at zoom 16 and upscale beyond that. */
+  const lightLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+    attribution: '&copy; <a href="https://www.esri.com/">Esri</a>, HERE, Garmin, &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxNativeZoom: 16, maxZoom: 19
   });
+  const lightLabelLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {
+    attribution: '', maxNativeZoom: 16, maxZoom: 19
+  });
+  const cartoLayer = L.layerGroup([lightLayer, lightLabelLayer]);   // keeps the switcher code below unchanged
   const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
     attribution: '&copy; <a href="https://www.esri.com/">Esri</a>, Maxar, Earthstar Geographics',
     maxZoom: 19
@@ -1239,7 +1249,7 @@ function initMap() {
   });
 
   const SAT_THUMB = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/10/427/279';
-  const MAP_THUMB = 'https://a.basemaps.cartocdn.com/light_all/10/279/427.png';
+  const MAP_THUMB = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/10/427/279';
 
   cartoLayer.addTo(map);
   let satelliteActive = false;

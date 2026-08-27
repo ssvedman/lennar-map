@@ -93,6 +93,8 @@ function makeLeafletStub(win) {
   return {
     map: () => map,
     tileLayer: () => ({ addTo(m) { m.addLayer(this); return this; } }),
+    // The light basemap is now a group (Esri base + label reference).
+    layerGroup: (ls) => ({ layers: ls || [], addTo(m) { m.addLayer(this); return this; } }),
     marker,
     divIcon: o => ({ options: o, html: o.html }),
     _map: map, _layers: layers
