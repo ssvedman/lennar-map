@@ -246,6 +246,36 @@ group('a direction the answer left off is weak evidence, not a refusal');
      'two independent roads landing together corroborate each other whatever the tagging');
 }
 
+group('when no geocoder has the roads, the development is still an answer');
+{
+  /* Twelve Tampa communities and 351 starts sit behind roads that are in
+     neither OpenStreetMap nor the US Census — checked against both, not
+     assumed. Re-running does not help; only time or a person does. But for
+     seven of them a phase is already on the map, and a development is one
+     piece of land. */
+  const loc = [{ name: 'Prosper 60', lat: 27.6257, lon: -82.4149 },
+               { name: 'Prosper TH', lat: 27.6294, lon: -82.4062 }];
+
+  const fb = C.developmentFallback('Prosper 40 COT', loc);
+  ok(fb, 'a development with placed phases offers its own position');
+  // The centre of the phases, not whichever one happened to sort first.
+  eq(fb.lat, 27.62755, 'at the centre of them');
+  eq(fb.lon, -82.41055, 'on both axes');
+  ok(/1.4 km/.test(fb.why),
+     'and the reason states the precision being claimed, so nobody reads it as surveyed');
+  ok(/Confirm/.test(fb.why), 'and says it is a question, not an answer');
+
+  eq(C.developmentFallback('K-Bar 20 ASC', loc), null,
+     'a development with nothing placed offers nothing — there is no guess to make');
+  eq(C.developmentFallback('Prosper 60', [{ name: 'Prosper 60', lat: 27.6, lon: -82.4 }]), null,
+     'and a community is never its own evidence');
+
+  /* It is a PROPOSAL. The distinction is the whole safety of the thing: this
+     was never checked against the community's own streets, so it must not
+     place anything by itself. */
+  ok(!('status' in fb), 'it carries no status — the caller decides, and it proposes');
+}
+
 group('a building schedule is not a street');
 {
   /* Tampa's log writes common-area buildings into the Address column —

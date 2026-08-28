@@ -360,6 +360,54 @@
     && h.lat >= BBOX.minLat && h.lat <= BBOX.maxLat
     && h.lon >= BBOX.minLon && h.lon <= BBOX.maxLon;
 
+  /* ── THE PHASE NEXT DOOR, WHEN NOTHING ELSE IS LEFT ───────────────────────
+     Offered only after the geocoders have been asked and have nothing: the
+     road is too new for OpenStreetMap and for the Census alike, and no amount
+     of re-running changes that this month.
+
+     What is still true is that a phase of the same development is already on
+     the map, and phases are the same piece of land — the widest development in
+     either division spans 1.4 km. So the development's own position is a real
+     answer to "roughly where is this", which is the question the map is for:
+     it exists to show where work is and how much of it, at a zoom where a
+     kilometre is a pin's width.
+
+     A PROPOSAL, never a placement, and that distinction is the whole safety of
+     it. Nothing here was verified against this community's own streets, so a
+     person confirms it — and confirming is something they can actually do,
+     unlike a lone street in a town they have no way to check. It is the
+     coordinate they would have looked up by hand anyway, filled in for them.
+
+     Skipped when a geocoded proposal already exists: that one is about THIS
+     community, and evidence about the thing itself outranks evidence about its
+     neighbours. */
+  function developmentFallback(name, located) {
+    const dev = developmentOf(name || "");
+    if (!dev) return null;
+    const sibs = (located || []).filter(s =>
+      s && s.name && Number.isFinite(s.lat) && Number.isFinite(s.lon) &&
+      !(s.lat === 0 && s.lon === 0) && developmentOf(s.name) === dev &&
+      s.name !== name);
+    if (!sibs.length) return null;
+
+    /* The centre of the development rather than whichever phase sorted first —
+       with several placed, the middle of them is the better guess for one whose
+       own position is unknown, and it does not depend on array order. */
+    const lat = +(sibs.reduce((a, s) => a + s.lat, 0) / sibs.length).toFixed(7);
+    const lon = +(sibs.reduce((a, s) => a + s.lon, 0) / sibs.length).toFixed(7);
+    const names = sibs.map(s => s.name);
+    return {
+      lat, lon, from: names,
+      why: "no geocoder has this community's streets yet, but "
+         + (names.length === 1 ? names[0] + " is"
+            : names.length + " phases of the same development are")
+         + " already on the map at this point. Phases sit on one piece of land — "
+         + "the widest development anywhere in the data spans 1.4 km — so this is "
+         + "the right neighbourhood, not the exact street. Confirm to put it on "
+         + "the map approximately, or place it precisely yourself"
+    };
+  }
+
   /* ── ASKING A NARROWER QUESTION WHEN A PHASE IS ALREADY PLACED ─────────────
      The refusal below tells a community it cannot be 143 km from its own phase.
      Useful, but it arrives too late to help: the geocoder was asked "where is
@@ -1885,7 +1933,7 @@
     PLACEHOLDER_PER_DAY, GROWTH_REFUSE,
     STREET_TYPES, DIRECTIONS, BBOX, AGREE_M, SIBLING_M, REJECT_M,
     streetOf, streetKey, sameStreet, nameMatch, metresBetween, inBox, developmentOf,
-    siblingBox, SIBLING_REFUSE_M,
+    siblingBox, developmentFallback, SIBLING_REFUSE_M,
     resolveLocation, pendingLocations, applyLocation,
     acceptProposal, rejectProposal, placeManually, parseLatLon, wasRejected,
     parseLocality, placeKey, localityAgrees, localitiesFrom,

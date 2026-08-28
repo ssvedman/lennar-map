@@ -538,8 +538,21 @@ async function fetchLocalities() {
 
     } else {
       CORE.applyLocation(rec, result);
-      stuck.push({ name: q.name, why: result.why });
-      console.log(`    · still pending — ${result.why}`);
+
+      /* Nothing was found for this community, but its development may already
+         be on the map. That is not a placement — it is the coordinate a person
+         would otherwise go and look up, offered for one click. See
+         developmentFallback. */
+      const fb = CORE.developmentFallback(q.name, located);
+      if (fb) {
+        rec.geo.proposed = { lat: fb.lat, lon: fb.lon, street: null, why: fb.why };
+        proposals.push({ name: q.name, lat: fb.lat, lon: fb.lon, why: fb.why });
+        console.log(`    ? ${fb.lat},${fb.lon} — its development, NOT applied`);
+        console.log(`      ${fb.from.join(', ')} ${fb.from.length === 1 ? 'is' : 'are'} already on the map`);
+      } else {
+        stuck.push({ name: q.name, why: result.why });
+        console.log(`    · still pending — ${result.why}`);
+      }
     }
   }
 
