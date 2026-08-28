@@ -162,6 +162,61 @@ group('one street alone is never trusted');
      'an unrelated community next door is not evidence about this one');
 }
 
+group('a placed phase narrows the question, not just the verdict');
+{
+  /* The refusal catches a wrong answer; this stops it being given. Same
+     evidence, used a step earlier — the geocoder is asked about the ground
+     around the development instead of the whole division, so the road next door
+     to the placed phase can surface instead of the same-named one 143 km away. */
+  const sib = [{ name: 'Twinflowers TH', lat: 28.299926, lon: -82.2709996 }];
+  const box = C.siblingBox('Twinflowers 40', sib);
+  ok(box, 'a development with a placed phase gets a narrowed box');
+
+  const inside = (la, lo) => la >= box.minLat && la <= box.maxLat
+                          && lo >= box.minLon && lo <= box.maxLon;
+  ok(inside(28.299926, -82.2709996), 'the phase itself is inside it');
+  ok(!inside(28.6279096, -80.8588306),
+     'the Titusville ALLENDALE STREET that was offered is outside it');
+
+  /* The box must never be tighter than the refusal, or it would hide answers
+     that would have been accepted. Checked at the corners of the acceptance
+     region rather than asserted in prose. */
+  const R = C.SIBLING_REFUSE_M;
+  const dLat = (R * 0.99) / 111320;
+  ok(inside(28.299926 + dLat, -82.2709996) && inside(28.299926 - dLat, -82.2709996),
+     'a point just inside the refusal radius north and south is still searchable');
+  const dLon = (R * 0.99) / (111320 * Math.cos(28.3 * Math.PI / 180));
+  ok(inside(28.299926, -82.2709996 + dLon) && inside(28.299926, -82.2709996 - dLon),
+     'and east and west — the longitude conversion is taken at the right latitude');
+
+  eq(C.siblingBox('Gladesong', []), null,
+     'a development with nothing placed gets no narrowing, and the division box stands');
+  eq(C.siblingBox('Gladesong', [{ name: 'Twinflowers TH', lat: 28.3, lon: -82.27 }]), null,
+     'and another development next door is not its phase');
+
+  // Clipped to the division: a coastal development must not widen the search past it.
+  const edge = C.siblingBox('Edge 40', [{ name: 'Edge 50', lat: 26.55, lon: -82.95 }]);
+  ok(edge.minLat >= 26.5 && edge.minLon >= -83.0,
+     'a box near the division edge is clipped to the division');
+}
+
+group('a building schedule is not a street');
+{
+  /* Tampa's log writes common-area buildings into the Address column —
+     eighteen of them on SouthCreek 20TH, which has a six-lookup budget. */
+  eq(C.streetOf('COMM BLDG - 0085-0090'), null, 'a common-building range is not an address');
+  eq(C.streetOf('Comm Bldg 12'), null, 'nor is a numbered one');
+  eq(C.streetOf('BLDG 0001-0006'), null, 'nor a bare building range');
+
+  /* And the roads that must survive it. CR-54 and US-301 are real Pasco County
+     roads and a first version of the filter ate both — the shape "letters, dash,
+     digits" is a highway at least as often as it is a label. */
+  eq(C.streetOf('CR-54'), 'CR-54', 'a county road survives');
+  eq(C.streetOf('US-301'), 'US-301', 'and a US route');
+  eq(C.streetOf('77TH AVE E'), '77TH AVE E', 'and a numbered grid street');
+  eq(C.streetOf('WOOD POND AVE'), 'WOOD POND AVE', 'and an ordinary one');
+}
+
 group('the eight impossible proposals Tampa actually produced');
 {
   /* Not invented shapes — these are the real names, the real streets and the

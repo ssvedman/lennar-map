@@ -479,8 +479,21 @@ async function fetchLocalities() {
             .filter(Boolean).join(', '));
     }
 
+    /* If a phase of this development is already on the map, ask the geocoder
+       about the ground around it rather than the whole division. Costs nothing
+       — same request, tighter viewbox — and it is the difference between being
+       handed the ALLENDALE STREET in Titusville and being handed the one next
+       door to Twinflowers TH. See siblingBox: it spans exactly the region an
+       answer could have been accepted in, so it cannot hide a legal result. */
+    const box = CORE.siblingBox(q.name, located) || CORE.BBOX;
+    if (box !== CORE.BBOX) {
+      console.log('    narrowing the search to within '
+        + (CORE.SIBLING_REFUSE_M / 1000) + ' km of its located phase'
+        + (locality ? '' : ' (no sheet, so this is the only narrowing available)'));
+    }
+
     const cands = await GEO.streetsFor(q.streets, {
-      county: COUNTY, bbox: CORE.BBOX, maxLookups: MAX, locality,
+      county: COUNTY, bbox: box, maxLookups: MAX, locality,
       /* Which answers are worth stopping early for — the same gates
          resolveLocation applies, so the search does not give up after two
          answers that were never going to count. */

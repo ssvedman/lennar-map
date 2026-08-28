@@ -254,6 +254,23 @@
     // A bare "TBD", or anything with no letters, is not a street.
     if (/^t\.?b\.?d\.?$/i.test(s)) return null;
     if (!/[a-z]/i.test(s)) return null;
+
+    /* Nor is a building schedule. Tampa's log writes the common-area buildings
+       into the same Address column as lot ranges — "COMM BLDG - 0085-0090",
+       eighteen of them on SouthCreek 20TH alone. They are not addresses, no
+       geocoder will ever find one, and they crowd the real streets: the lookup
+       budget is six per community and every slot one of these takes is a road
+       that never got asked about.
+
+       Deliberately narrow: it names the labels the logs actually use, and wants
+       a numeric RANGE before dropping anything on shape alone. The first draft
+       matched "a word, a dash, some digits" and quietly ate CR-54 and US-301 —
+       real Pasco County roads, and exactly the kind a new subdivision sits on.
+       The asymmetry settles it: an unrecognised label costs one lookup and a
+       "no result", while a discarded street can cost a community its pin. */
+    if (/^(?:comm(?:on)?|cmn)\s*(?:bldg|building|area)\b/i.test(s)) return null;
+    if (/\b(?:bldg|building|unit|lot|lots|phase|tract)\b/i.test(s)
+        && /\d+\s*[-–—]\s*\d+\s*$/.test(s)) return null;
     return s.toUpperCase();
   }
 
@@ -309,6 +326,50 @@
   const inBox = h => !!h && Number.isFinite(h.lat) && Number.isFinite(h.lon)
     && h.lat >= BBOX.minLat && h.lat <= BBOX.maxLat
     && h.lon >= BBOX.minLon && h.lon <= BBOX.maxLon;
+
+  /* ── ASKING A NARROWER QUESTION WHEN A PHASE IS ALREADY PLACED ─────────────
+     The refusal below tells a community it cannot be 143 km from its own phase.
+     Useful, but it arrives too late to help: the geocoder was asked "where is
+     ALLENDALE STREET in the whole division", answered with the one in Titusville,
+     and the answer had to be thrown away. The road actually wanted may well have
+     been the second or third result, or may simply not have been asked for.
+
+     So when a development already has a phase on the map, ask the narrower
+     question instead — the same trick the Community Information Sheet plays with
+     a city and postcode, using evidence we already hold rather than evidence
+     somebody has to type. Nominatim takes viewbox + bounded, which the division
+     filter already uses; this only tightens the box.
+
+     Sized to exactly the region where an answer would be ACCEPTED anyway: every
+     located phase, expanded by the same radius beyond which a sibling refuses. A
+     point outside this box could not have survived resolveLocation, so nothing
+     findable is lost — the box cannot change which answers are legal, only which
+     ones the geocoder bothers to return. Clipped to the division, because a
+     development near the edge would otherwise widen the search past it. */
+  function siblingBox(name, located, radiusM) {
+    const dev = developmentOf(name || "");
+    if (!dev) return null;
+    const sibs = (located || []).filter(s =>
+      s && s.name && Number.isFinite(s.lat) && Number.isFinite(s.lon) &&
+      !(s.lat === 0 && s.lon === 0) && developmentOf(s.name) === dev);
+    if (!sibs.length) return null;
+
+    const r = radiusM || SIBLING_REFUSE_M;
+    const lats = sibs.map(s => s.lat), lons = sibs.map(s => s.lon);
+    const dLat = r / 111320;
+    /* A degree of longitude shrinks towards the poles, so converting the radius
+       at the wrong latitude makes the box too narrow east-west — which WOULD
+       start excluding legal answers. Taken at the phases' own latitude. */
+    const midLat = lats.reduce((a, v) => a + v, 0) / lats.length;
+    const dLon = r / (111320 * Math.max(0.15, Math.cos(midLat * Math.PI / 180)));
+
+    return {
+      minLat: Math.max(Math.min.apply(null, lats) - dLat, BBOX.minLat),
+      maxLat: Math.min(Math.max.apply(null, lats) + dLat, BBOX.maxLat),
+      minLon: Math.max(Math.min.apply(null, lons) - dLon, BBOX.minLon),
+      maxLon: Math.min(Math.max.apply(null, lons) + dLon, BBOX.maxLon)
+    };
+  }
 
   /* Both thresholds are set from the division's actual geometry, not guessed.
      Measured across the 71 located communities:
@@ -1760,6 +1821,7 @@
     PLACEHOLDER_PER_DAY, GROWTH_REFUSE,
     STREET_TYPES, DIRECTIONS, BBOX, AGREE_M, SIBLING_M, REJECT_M,
     streetOf, streetKey, sameStreet, metresBetween, inBox, developmentOf,
+    siblingBox, SIBLING_REFUSE_M,
     resolveLocation, pendingLocations, applyLocation,
     acceptProposal, rejectProposal, placeManually, parseLatLon, wasRejected,
     parseLocality, placeKey, localityAgrees, localitiesFrom,
