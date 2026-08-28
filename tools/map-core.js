@@ -329,6 +329,29 @@
   const AGREE_M = 1500;      // two streets of ONE community
   const SIBLING_M = 3000;    // another located phase of the same development
 
+  /* And the distance at which a located phase stops being silent and starts
+     REFUSING. Corroboration was the only thing a sibling could do — within 3 km
+     it vouched, beyond that it said nothing — and "says nothing" is the wrong
+     reading of a development whose other phases are ninety kilometres from the
+     point on offer. Phases of one development are adjacent by construction: the
+     same piece of land, bought once and built out in stages.
+
+     Tampa's first run made the cost visible. Twelve proposals went to a person
+     to confirm and eight were impossible on evidence already in the document —
+     "Seaire 40" offered in Orlando with Seaire 50 sitting 136 km away in Manatee
+     County, "Acacia 50" 88 km from three located Acacias, both Stonegates 20-odd
+     km from the Stonegate already on the map. Every one was a correctly-spelled
+     street of the same name in another town: the exact failure this file exists
+     to prevent, arriving through the one gap where the strongest evidence
+     available was never consulted.
+
+     Deliberately five times the corroboration radius, leaving a wide band
+     between 3 and 15 km where a sibling neither vouches nor refuses. The widest
+     real development spans 1.4 km, so 15 km is an order of magnitude past
+     anything genuine — the band is for a development that grows in a way nobody
+     has seen yet, not for the cases above. */
+  const SIBLING_REFUSE_M = 15000;
+
   /* Development name, for sibling matching: "Waterlin 40RL" and "Waterlin 50" are
      both Waterlin. The map's own index.html has the same rule for grouping pins;
      a test asserts the two agree, since they must.
@@ -601,6 +624,7 @@
     const o = opts || {};
     const agreeM = o.agreeM || AGREE_M;
     const siblingM = o.siblingM || SIBLING_M;
+    const refuseM = o.siblingRefuseM || SIBLING_REFUSE_M;
     const tried = [];
     const good = [];
 
@@ -712,11 +736,50 @@
                                .filter(l => l && !l.agrees)[0] || null;
     const sheet = (o.locality && o.locality.source) || "the Community Information Sheet";
 
+    /* The already-located phases of this same development, and how far the
+       nearest one is from a given point. Hoisted above the two-street branch
+       because both branches consult it now — one to question, one to refuse. */
+    const devName = developmentOf(o.name || "");
+    const sibs = (siblings || []).filter(s =>
+      s && s.name && Number.isFinite(s.lat) && Number.isFinite(s.lon) &&
+      developmentOf(s.name) === devName && devName);
+    const nearestSib = pt => {
+      let near = null;
+      for (const s of sibs) {
+        const d = metresBetween(pt, s);
+        if (d != null && (!near || d < near.d)) near = { s, d };
+      }
+      return near;
+    };
+    const farFrom = pt => {
+      const n = nearestSib(pt);
+      return n && n.d > refuseM ? n : null;
+    };
+    const km = d => (d / 1000).toFixed(d < 10000 ? 1 : 0);
+
     if (best.length >= 2) {
       const c = centre(best);
       const streetsSaid = best.length + " streets agree within "
                         + (agreeM / 1000) + " km: " + best.map(g => g.street).join(", ");
       const bad = conflictIn(best);
+
+      /* Two agreeing streets are the strongest evidence here, so a distant
+         sibling QUESTIONS them rather than refusing — the same weighting the
+         sheet gets a few lines down. One of the two is wrong and a person picks
+         which; what must not happen is it going in unwatched. */
+      const away = farFrom(c);
+      if (away) {
+        return { status: "proposed", lat: c.lat, lon: c.lon,
+                 confidence: "agreement",
+                 evidence: [streetsSaid,
+                            "but " + away.s.name + ", a located phase of the same "
+                            + "development, is " + km(away.d) + " km away"],
+                 why: "the streets agree with each other but land " + km(away.d)
+                    + " km from " + away.s.name + ", which is already on the map — "
+                    + "phases of one development do not sit that far apart, so one "
+                    + "of the two is wrong",
+                 tried };
+      }
 
       /* Two independent street names landing on the same patch of ground is the
          strongest evidence this file has. A single field on a hand-filled sheet
@@ -740,11 +803,6 @@
     /* Only one street resolved to a point nothing else corroborates. Look for an
        already-located sibling phase of the same development. */
     const only = good[0];
-    const devName = developmentOf(o.name || "");
-    const sibs = (siblings || []).filter(s =>
-      s && s.name && Number.isFinite(s.lat) && Number.isFinite(s.lon) &&
-      developmentOf(s.name) === devName && devName);
-
     for (const s of sibs) {
       const d = metresBetween(only, s);
       if (d != null && d <= siblingM) {
@@ -762,6 +820,31 @@
         return { status: "located", lat: only.lat, lon: only.lon,
                  confidence: "sibling", evidence: [said], tried };
       }
+    }
+
+    /* THE SIBLING MAY REFUSE. One street, nothing corroborating it, and this
+       development's own located phases are a county away. That is not "no
+       corroboration" — it is evidence against, and the best evidence available:
+       a placed pin got there by two streets agreeing, by a person, or by another
+       corroborated sibling, where the point on offer rests on one road name that
+       Florida reuses freely.
+
+       Symmetrical with the sheet's veto below and refused for the same reason:
+       both may only overrule the weakest case, a lone uncorroborated street.
+       Neither touches two agreeing streets, which are handled above.
+
+       Offering these anyway is not harmless. Confirming a proposal is one click
+       and the reasons are long; a list where two thirds cannot be right teaches
+       people to click through it, which costs the four that deserved reading. */
+    const away = farFrom(only);
+    if (away) {
+      return { status: "pending", tried,
+               why: '"' + only.street + '" was found, but ' + km(away.d)
+                  + " km from " + away.s.name + " — a phase of the same development "
+                  + "that is already on the map. Nothing else corroborates the point, "
+                  + "and one development does not span that distance, so this is "
+                  + "almost certainly a same-named street in another town. Place it "
+                  + "by hand, or wait for a second street to be mapped" };
     }
 
     /* Has this exact proposal already been put to somebody and refused? Checked
@@ -809,14 +892,25 @@
        strength of its postcode: the geocoder must have found exactly ONE road of
        that name. It is asked for five results, and if several came back the one
        used is simply the first — which is a coin flip, not corroboration. */
+    /* The reason has to say what was actually established. This branch read
+       "the postcode agrees, but the name matches more than one road" whatever
+       the sheet had said — including, as on Tampa's first run, when there was no
+       sheet at all: Community-DB held nothing for the division, so every one of
+       these claimed an agreement that never happened. A reason a reader can
+       check is the only thing making a proposal reviewable rather than a button
+       to press. */
     if (only.ambiguous) {
+      const agreed = only.locality && only.locality.agrees;
       return {
         status: "proposed", lat: only.lat, lon: only.lon,
         confidence: "single", street: only.street,
         evidence: ['"' + only.street + '" matches ' + (only.ambiguous + 1)
                    + " different roads; this is the first of them"],
-        why: "the postcode agrees, but the name matches more than one road and "
-           + "nothing says which — confirm before applying",
+        why: (agreed
+                ? "the postcode agrees, but the name matches more than one road"
+                : "nothing corroborates this point, and the name matches more "
+                  + "than one road")
+           + " and nothing says which — confirm before applying",
         tried
       };
     }

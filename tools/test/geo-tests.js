@@ -114,12 +114,45 @@ group('one street alone is never trusted');
   eq(sib.confidence, 'sibling', 'recorded as sibling evidence, not agreement');
   ok(/Cypress Rsrv SF/.test(sib.evidence[0]), 'naming which sibling vouched for it');
 
-  // A sibling on the other side of the division vouches for nothing.
+  /* A sibling on the other side of the division does not merely fail to
+     corroborate — it REFUSES. This used to be `proposed` with the distance
+     mentioned in the reason, which is how Tampa's first run put eight
+     impossible points in front of a person: "Seaire 40" offered in Orlando
+     while Seaire 50 sat 136 km away in Manatee County. Phases of one
+     development are the same piece of land; a candidate a county away from all
+     of them is a same-named street somewhere else, and saying so is not a
+     judgement call. */
   const far = C.resolveLocation(
     [{ street: 'SWEET CHERRY LOOP', hit: hit(28.0, -81.9, 'Sweet Cherry Loop') }],
     [{ name: 'Cypress Rsrv SF', lat: 29.4, lon: -81.1 }], { name: 'Cypress Rsrv TH' });
-  eq(far.status, 'proposed', 'a distant sibling does not corroborate');
-  ok(/km from every located phase/.test(far.why), 'and the reason says so');
+  eq(far.status, 'pending', 'a sibling a county away refuses, rather than shrugging');
+  ok(/Cypress Rsrv SF/.test(far.why), 'the reason names the phase that refused it');
+  ok(/km/.test(far.why), 'and how far away it is: ' + far.why);
+  ok(far.lat == null, 'and no point is carried, because none is being offered');
+
+  /* Between corroborating and refusing there is a band where it does neither.
+     A development wider than 3 km would refuse to corroborate its own phases —
+     none exists today, but the refusal radius is five times the corroboration
+     one so that the first genuinely wider development is questioned rather
+     than rejected. */
+  const grey = C.resolveLocation(
+    [{ street: 'SWEET CHERRY LOOP', hit: hit(28.0, -81.9, 'Sweet Cherry Loop') }],
+    [{ name: 'Cypress Rsrv SF', lat: 28.06, lon: -81.94 }], { name: 'Cypress Rsrv TH' });
+  eq(grey.status, 'proposed',
+     'a sibling too far to vouch but too near to refuse leaves it for a person');
+  ok(/km from every located phase/.test(grey.why), 'and the reason says why: ' + grey.why);
+
+  /* The refusal only overrules the weakest evidence. Two streets agreeing is
+     the strongest thing here, so a distant sibling questions them instead —
+     one of the two is wrong and a person picks which. */
+  const twoVsFar = C.resolveLocation(
+    [{ street: 'SWEET CHERRY LOOP', hit: hit(28.0, -81.9, 'Sweet Cherry Loop') },
+     { street: 'MAHI PLACE', hit: hit(28.004, -81.904, 'Mahi Place') }],
+    [{ name: 'Cypress Rsrv SF', lat: 29.4, lon: -81.1 }], { name: 'Cypress Rsrv TH' });
+  eq(twoVsFar.status, 'proposed',
+     'two agreeing streets are questioned by a distant sibling, never refused');
+  ok(/Cypress Rsrv SF/.test(twoVsFar.why),
+     'and the reason names what they are being weighed against: ' + twoVsFar.why);
 
   // A sibling is a phase of the same development, not just any community.
   const unrelated = C.resolveLocation(
@@ -127,6 +160,57 @@ group('one street alone is never trusted');
     [{ name: 'Wellness 40RL', lat: 28.001, lon: -81.901 }], { name: 'Cypress Rsrv TH' });
   eq(unrelated.status, 'proposed',
      'an unrelated community next door is not evidence about this one');
+}
+
+group('the eight impossible proposals Tampa actually produced');
+{
+  /* Not invented shapes — these are the real names, the real streets and the
+     real coordinates from the first Tampa locate run, alongside the phases that
+     were already on the map when each was offered. Every one went to a person
+     to confirm. Kept as data so the regression names itself: if any of these
+     starts being offered again, the rule that stopped it has gone. */
+  const CASES = [
+    ['Vista Walk 55',   'MAGGIORE ROAD',    27.0931999, -82.4510543,
+     [['Vista Walk MAJ',  28.370146,  -82.2110002]]],
+    ['Twinflowers COT', 'ALLENDALE STREET', 28.6279096, -80.8588306,
+     [['Twinflowers 50',  28.2981522, -82.2709781], ['Twinflowers TH', 28.299926, -82.2709996]]],
+    ['Twinflowers 40',  'ALLENDALE STREET', 28.6279096, -80.8588306,
+     [['Twinflowers TH',  28.299926,  -82.2709996]]],
+    ['Seaire 40',       'BAY LEAF DR',      28.3872249, -81.415111,
+     [['Seaire 50',       27.5959312, -82.4766503], ['Seaire 50 CLA', 27.5957552, -82.4781997]]],
+    ['Acacia 50',       'HERITAGE OAK DR',  28.6062521, -81.438266,
+     [['Acacia 40',       28.3054206, -82.2690355], ['Acacia 18 SER', 28.3086634, -82.2676067]]],
+    ['Curiosity 50',    'SEABOARD DR',      28.1572944, -82.7458824,
+     [['Curiosity 40',    27.6279882, -82.5019477], ['Curiosity CLA', 27.6297424, -82.5021323]]],
+    ['Stonegate 55CLA', '77TH AVE E',       27.4023135, -82.3323178,
+     [['Stonegate 65s',   27.617976,  -82.4957245]]],
+    ['Stonegate 65 PA', '71ST TER E',       27.4140667, -82.5158948,
+     [['Stonegate 65s',   27.617976,  -82.4957245]]]
+  ];
+
+  for (const [name, street, lat, lon, sibs] of CASES) {
+    const siblings = sibs.map(([n, la, lo]) => ({ name: n, lat: la, lon: lo }));
+    /* `others` reproduces the ambiguity these all carried — the geocoder found
+       more than one road of the name, which is the branch that was offering
+       them. The refusal has to come BEFORE that branch, or it never fires. */
+    const r = C.resolveLocation(
+      [{ street, hit: Object.assign(hit(lat, lon, street),
+                                    { others: [{ matchedStreet: street }] }) }],
+      siblings, { name });
+    eq(r.status, 'pending', name + ' is refused, not offered for confirmation');
+    ok(new RegExp(sibs[0][0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).test(r.why) ||
+       sibs.some(s2 => r.why.indexOf(s2[0]) !== -1),
+       name + ': the reason names a located phase — ' + r.why);
+  }
+
+  /* And the four that were genuine questions stay questions: no located phase
+     of those developments exists, so there is nothing to weigh against and a
+     person is the right answer. */
+  const genuine = C.resolveLocation(
+    [{ street: 'SPLASH ISLE', hit: hit(28.3137945, -82.2903261, 'Splash Isle') }],
+    [], { name: 'Mirada AA 27V' });
+  eq(genuine.status, 'proposed',
+     'Mirada AA 27V has no located phase, so it is still asked rather than refused');
 }
 
 group('two streets that disagree do not average into a wrong answer');
