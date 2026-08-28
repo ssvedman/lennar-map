@@ -200,6 +200,52 @@ group('a placed phase narrows the question, not just the verdict');
      'a box near the division edge is clipped to the division');
 }
 
+group('a direction the answer left off is weak evidence, not a refusal');
+{
+  /* Manatee County numbers its grid and hangs a direction off it, and
+     OpenStreetMap tags that suffix inconsistently — in one run "71ST TER E"
+     came back as "71st Terrace E" and matched, while "77TH AVE E" came back as
+     plain "77th Avenue" and was thrown away. Same county, same grid, same
+     minute. Omission is missing information; contradiction is a different
+     road. */
+  eq(C.nameMatch('77TH AVE E', '77th Avenue East'), 'exact', 'a spelled-out direction matches');
+  eq(C.nameMatch('71ST TER E', '71st Terrace E'), 'exact', 'and an abbreviated one');
+  eq(C.nameMatch('77TH AVE E', '77th Avenue'), 'weak', 'a MISSING direction is weak, not wrong');
+  eq(C.nameMatch('77TH AVE E', '77th Avenue West'), 'no',
+     'but the opposite direction is a different road and stays refused');
+  eq(C.nameMatch('WHITE HOLLY AVE', 'White Hollow Ave'), 'no',
+     'and nothing else is loosened — a near-miss name is still a different street');
+
+  const hit2 = (lat, lon, street) =>
+    ({ lat, lon, precision: 'street', source: 'nominatim', matchedStreet: street });
+
+  /* Weak needs corroboration, and a placed phase 400 m away is exactly that. */
+  const withSib = C.resolveLocation(
+    [{ street: '77TH AVE E', hit: hit2(27.6159, -82.4921, '77th Avenue') }],
+    [{ name: 'Stonegate 65s', lat: 27.617976, lon: -82.4957245 }],
+    { name: 'Stonegate 55CLA' });
+  eq(withSib.status, 'located', 'a weak name corroborated by a near phase places');
+  eq(withSib.confidence, 'sibling', 'on the sibling’s authority, not the name’s');
+
+  /* And on its own it is not even offered. A proposal is a question, and this
+     one cannot be answered by looking at a map — both roads exist, both are
+     plausible, and only the tag that is missing tells them apart. */
+  const alone = C.resolveLocation(
+    [{ street: '77TH AVE E', hit: hit2(27.40, -82.33, '77th Avenue') }], [],
+    { name: 'Somewhere 50' });
+  eq(alone.status, 'pending', 'a weak name with nothing behind it is not offered at all');
+  ok(/direction/.test(alone.why), 'and the reason says what is missing: ' + alone.why);
+  ok(alone.lat == null, 'no point is carried, so nobody can confirm it by accident');
+
+  // Two weak-named streets agreeing with each other still corroborate.
+  const twoWeak = C.resolveLocation(
+    [{ street: '77TH AVE E', hit: hit2(27.6159, -82.4921, '77th Avenue') },
+     { street: '71ST TER E', hit: hit2(27.6165, -82.4930, '71st Terrace') }], [],
+    { name: 'Stonegate 55CLA' });
+  eq(twoWeak.status, 'located',
+     'two independent roads landing together corroborate each other whatever the tagging');
+}
+
 group('a building schedule is not a street');
 {
   /* Tampa's log writes common-area buildings into the Address column —

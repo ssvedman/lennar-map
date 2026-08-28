@@ -307,6 +307,39 @@
     return !!sa && !!sb && sa === sb;
   }
 
+  /* ── A DIRECTION THE ANSWER LEFT OUT ──────────────────────────────────────
+     sameStreet stays exactly as strict as it reads: it decides, on its own,
+     whether a pin may be placed, and every relaxation of it is a chance to put
+     one in the wrong town. This is a separate, weaker question asked only after
+     it has said no.
+
+     Manatee County numbers its grid and hangs a direction off it — 77th Avenue
+     East and 77th Avenue West are different roads a few miles apart, and
+     confusing them is precisely the failure being guarded against. But
+     OpenStreetMap tags that suffix inconsistently: "71ST TER E" came back as
+     "71st Terrace E" and matched, while "77TH AVE E" came back as plain "77th
+     Avenue" and was refused. Same county, same grid, same run.
+
+     So the distinction is between an answer that OMITS the direction and one
+     that CONTRADICTS it. Omission is missing information — the road may well be
+     the right one, tagged carelessly. Contradiction is a different road, and
+     stays a hard no. Returns "exact", "weak" or "no"; what a caller may do with
+     "weak" is decided in resolveLocation, and it is never enough on its own. */
+  const DIR_SET = new Set(Object.values(DIRECTIONS));
+  function directionsIn(key) {
+    return String(key || "").split(" ").filter(t => DIR_SET.has(t));
+  }
+  function nameMatch(asked, matched) {
+    if (sameStreet(asked, matched)) return "exact";
+    const a = streetKey(asked), b = streetKey(matched);
+    if (!a || !b) return "no";
+    const da = directionsIn(a), db = directionsIn(b);
+    // Only the case where one side names a direction and the other names none.
+    if (!(da.length && !db.length) && !(db.length && !da.length)) return "no";
+    const drop = k => k.split(" ").filter(t => !DIR_SET.has(t)).join(" ");
+    return sameStreet(drop(a), drop(b)) ? "weak" : "no";
+  }
+
   // Metres between two {lat,lon}. Null-safe: a missing coordinate is not a
   // position at 0,0, it is the absence of one, so the answer is null.
   function metresBetween(a, b) {
@@ -694,12 +727,21 @@
       if (!h)             { tried.push({ street: c.street, result: "no result" }); continue; }
       if (h.error)        { tried.push({ street: c.street, result: "geocoder error: " + h.error }); continue; }
       if (!inBox(h))      { tried.push({ street: c.street, result: "outside the division" }); continue; }
-      if (!sameStreet(c.street, h.matchedStreet)) {
+      const nameKind = nameMatch(c.street, h.matchedStreet);
+      if (nameKind === "no") {
         // The single most dangerous case, so it is named explicitly rather than
         // lumped in with "no result".
         tried.push({ street: c.street,
                      result: 'matched a different street ("' + (h.matchedStreet || "?") + '") — rejected' });
         continue;
+      }
+      /* "weak" means the answer left a direction off a name that had one. It
+         is carried, not discarded, but it may never place a community by
+         itself — see the gate on the single-street path. */
+      if (nameKind === "weak") {
+        tried.push({ street: c.street,
+                     result: 'matched "' + (h.matchedStreet || "?") + '", which omits the '
+                           + 'direction — kept, but it cannot place this on its own' });
       }
       /* What Community-DB says about the town is RECORDED here and weighed
          later — it is deliberately not a veto at this point.
@@ -731,13 +773,17 @@
         continue;
       }
 
-      tried.push({ street: c.street, result: "matched", lat: h.lat, lon: h.lon,
-                   precision: h.precision || null, source: h.source || null,
-                   locality: loc ? loc.on : null,
-                   localityAgrees: loc ? loc.agrees : null });
+      if (nameKind === "exact") {
+        tried.push({ street: c.street, result: "matched", lat: h.lat, lon: h.lon,
+                     precision: h.precision || null, source: h.source || null,
+                     locality: loc ? loc.on : null,
+                     localityAgrees: loc ? loc.agrees : null });
+      }
       good.push({ street: c.street, lat: h.lat, lon: h.lon,
                   precision: h.precision || null, source: h.source || null,
                   locality: loc || null,
+                  weakName: nameKind === "weak",
+                  matchedStreet: h.matchedStreet || null,
                   // How many OTHER roads of this name the geocoder also found.
                   ambiguous: (h.others || []).filter(x =>
                     sameStreet(c.street, x.matchedStreet)).length });
@@ -864,6 +910,22 @@
     /* Only one street resolved to a point nothing else corroborates. Look for an
        already-located sibling phase of the same development. */
     const only = good[0];
+
+    /* A name we are not certain of gets no independent authority. The sibling
+       and agreement paths may still carry it — corroboration is what a weak
+       match needs and exactly what those provide — but the lone-street paths
+       below place a community on the strength of the name alone, and this name
+       is missing the very token that distinguishes 77th Avenue East from 77th
+       Avenue West. Handled before them so it cannot leak into one. */
+    const weakAlone = () => ({
+      status: "pending", tried,
+      why: '"' + only.street + '" only matched "' + (only.matchedStreet || "?")
+         + '", which leaves off the direction — and 77th Avenue East and 77th '
+         + "Avenue West are different roads. Nothing else corroborates the point, "
+         + "so it is not being offered. It will place itself once a phase of this "
+         + "development is on the map, or a second street is mapped"
+    });
+
     for (const s of sibs) {
       const d = metresBetween(only, s);
       if (d != null && d <= siblingM) {
@@ -897,6 +959,8 @@
        Offering these anyway is not harmless. Confirming a proposal is one click
        and the reasons are long; a list where two thirds cannot be right teaches
        people to click through it, which costs the four that deserved reading. */
+    if (only.weakName) return weakAlone();
+
     const away = farFrom(only);
     if (away) {
       return { status: "pending", tried,
@@ -1820,7 +1884,7 @@
     COMMUNITY_ALIASES, COMMUNITY_SPLIT, IGNORED_DEVELOPMENTS, AWAITING_CONTACTS,
     PLACEHOLDER_PER_DAY, GROWTH_REFUSE,
     STREET_TYPES, DIRECTIONS, BBOX, AGREE_M, SIBLING_M, REJECT_M,
-    streetOf, streetKey, sameStreet, metresBetween, inBox, developmentOf,
+    streetOf, streetKey, sameStreet, nameMatch, metresBetween, inBox, developmentOf,
     siblingBox, SIBLING_REFUSE_M,
     resolveLocation, pendingLocations, applyLocation,
     acceptProposal, rejectProposal, placeManually, parseLatLon, wasRejected,
